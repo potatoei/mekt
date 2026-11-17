@@ -1,0 +1,33 @@
+# Normalise text to LF in the repository, and be explicit about it rather than
+# relying on each machine's core.autocrlf.
+#
+# This exists because of a real failure: on Windows/WSL a clone with
+# core.autocrlf=true checks files out as CRLF, and git then reports them as
+# permanently modified even when `git diff` prints nothing. The visible effect
+# is a checkout that refuses to proceed:
+#
+#   error: Your local changes to the following files would be overwritten by
+#   checkout: README.md
+#   Please commit your changes or stash them before you switch branches.
+#
+# with no diff to commit or stash. Declaring the rule here means every clone
+# gets the same answer and `git status` means what it says.
+* text=auto eol=lf
+
+# Markdown is the one place this repo is read as text by people, and the only
+# place the CRLF problem has bitten. Pin it explicitly.
+*.md text eol=lf
+
+# Generated/committed binaries: never touch their bytes. Git would otherwise
+# try to normalise anything it mistakes for text, and a bundle or a .wasm that
+# has been newline-translated is corrupt in a way that fails far from here.
+*.bundle binary
+*.wasm   binary
+*.png    binary
+*.jpg    binary
+*.gif    binary
+*.zip    binary
+
+# The engine patch is a byte-exact artifact: `git am` verifies whitespace and
+# line endings against the stored blob, so normalising it breaks it.
+*.patch  binary
