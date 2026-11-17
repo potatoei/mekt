@@ -75,8 +75,16 @@ Not all of my changes are equal. In order of "safe to take today":
 
 ## Step 2 — prove the engine changes are safe
 
-Two commands, both should be green before you trust anything else. From
-`wine-assembly/`:
+First, one dependency install — the D3D9 tests decode real PNGs and module
+resolution fails without it (this is the single most common "the test is
+broken" here, and it is not):
+
+```bash
+cd wine-assembly
+npm install --omit=dev     # pngjs + wabt, no build toolchain needed
+```
+
+Then two commands, both should be green before you trust anything else:
 
 ```bash
 bash tools/build.sh          # expect "Build complete: ... 1765269 bytes"
@@ -143,6 +151,13 @@ node tools/mbaa-texture-census.js /path/to/MBAACC/0003.p --out=ranges-0003.json
 The tool reads **42 MB of RAM and 22 ms** for a 1.6 GB archive, so
 nothing here is expensive. `--list` prints one line per member:
 `texture:raw 65536 @0x000a1234 spr_foo.bin`.
+
+Everything above was verified in a **fresh clone of the pinned base with only
+the patch applied** — build green, every listed test `PASS` — so if a step
+fails for you, it is the environment and not the patch. The one environment
+trap is `npm install --omit=dev` (step 2); without it `pngjs` is missing and
+`test-d3d9-palette-state.js` fails with `Cannot find module 'pngjs'`, which
+looks like a broken change and is not.
 
 ### 3c. Read the three numbers
 
@@ -364,3 +379,24 @@ node tools/dev-server.js          # then open http://127.0.0.1:8080/
 - [ ] no white placeholders with `?d3d9-audit=textures`
 - [ ] HUD `waiting` line says which of park/s or fill/s is nonzero during a
       slow menu, and that number goes to zero after the corresponding fix
+
+---
+
+## Appendix — verified from a clean clone
+
+The patch was applied to a fresh clone of the pinned submodule base and the
+whole chain re-run, so these are observed results and not claims:
+
+```
+git checkout 8e79a8637
+git am docs/mbaa/mbaa-engine-fixes.patch     -> 2 commits, no conflicts
+bash tools/build.sh                          -> 1765269 bytes, exit 0
+npm install --omit=dev                       -> pngjs, wabt
+node test/test-readfile-park-idempotence.js  -> PASS
+node test/test-mbaa-texture-census.js        -> PASS
+node test/test-d3d9-palette-state.js         -> PASS
+node test/test-d3d9-p8-conversion.js         -> PASS
+```
+
+The only failure encountered was `Cannot find module 'pngjs'` before step 2's
+install, which is why that install is now the first thing in step 2.
