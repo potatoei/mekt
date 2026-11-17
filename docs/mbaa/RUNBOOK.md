@@ -44,14 +44,21 @@ Nothing to do — the commit is already on the branch. Skip to step 2.
 ### If you are applying this elsewhere (your own machine)
 
 ```bash
-# 1. Root repo: fetch the branch (contains the audit doc + the patch file)
+# 1. Root repo: fetch the branch and its submodule.
+#    The submodule now points at the fork's main (c3f0474), which exists on a
+#    real remote, so this no longer fails with "upload-pack: not our ref".
 git fetch origin arena/42e272c4-mekt
 git checkout arena/42e272c4-mekt
+git submodule update --init          # -> c3f0474, from potatoei/wine-assembly
 
-# 2. Submodule: apply the engine patch
+# 2. Submodule: apply the engine patch (baselined on c3f0474, applies clean)
 cd wine-assembly
-git am /path/to/mekt/docs/mbaa/mbaa-engine-fixes.patch
+git am ../docs/mbaa/mbaa-engine-fixes.patch
 ```
+
+Verified end to end from a clean clone: fetch, checkout, submodule update and
+`git am` all exit 0 with no conflicts, and `tools/build.sh` then produces
+1769509 bytes.
 
 `git am` applies both commits with their messages intact. If your submodule is
 not at `8e79a8637`, apply with `git apply --3way` instead and read
