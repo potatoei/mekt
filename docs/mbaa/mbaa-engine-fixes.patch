@@ -1,0 +1,2666 @@
+From c3963456c1cb0b8ae437110059397176b52bbdfe Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Tue, 17 Nov 2026 03:56:08 +0000
+Subject: [PATCH 1/2] mbaa: preload policy, ReadFile park contract, P8
+ palettes, census tool, HUD wait rates
+
+The five issues from the project owner, plus the two GitHub issues that share
+their mechanism. Where a fix could not be verified against real MBAACC files,
+the reasoning and the exact measurement that would settle it are in
+docs/mbaa/AUDIT_2026-11-17.md (root repo).
+
+ReadFile / lazy streaming (dialogue tearing, black battles, white textures)
+  * fs_read_file_at and fs_read_file wrote a byte count to the guest's
+    *lpBytesRead on every PARKED attempt. A park is re-entered from the top, so
+    a 0 there is not "no bytes", it is "this call has not happened yet"; a guest
+    that samples it publishes a truncated count -- the reported "The" / "Th" /
+    "The..." dialogue. Parked attempts now leave the slot alone, and completed
+    reads still publish the real count.
+  * The WAT OVERLAPPED branch wrote the count only to OVERLAPPED.InternalHigh
+    and never through lpBytesRead; Win32's contract is both.
+  * Tests: test-readfile-park-idempotence.js.
+
+Preload policy (report 1: stream everything before play)
+  * host.js rejected `loadMode: 'lazy'` together with `preloadRanges`, which is
+    exactly the shape lib/app-files.js emits -- the declared preload would have
+    thrown at launch. Only decodeImage stays required-only.
+  * Whole-file preloads are summed and warned about above 64 MB; mbaa as
+    declared is 1040 MB at launch until ranges arrive.
+  * ?lazy-files drops the preload declarations for one launch (?eager-files
+    remains the opposite control arm).
+  * Tests: test-app-files-policy.js (budget case), test-app-files-switches.js.
+
+D3D9 texture formats (report 4: white placeholders)
+  * D3DFMT_P8 is a storable format: 16 palettes are real device state
+    ($d3d9_program_alloc 25616 -> 42000), SetPalette/GetPalette work, and the
+    host expands indices through the palette instead of drawing indices as
+    grey. Cache key is an FNV-1a mark of the palette, not a generation counter.
+  * Missing palette on upload fails loudly; ?d3d9-audit=textures logs every
+    upload for field reports.
+  * Tests: test-d3d9-palette-state.js, test-d3d9-p8-conversion.js, and the
+    41-is-storable updates to test-d3d9-textures.js / -argb4444.js.
+
+Measurement (report 5: menus at 20 FPS)
+  * tools/mbaa-texture-census.js emits preloadRanges for only the texture
+    members of a .p archive. It decides the name-table layout empirically (the
+    cursor must land exactly on the first member's data), refuses an archive it
+    cannot parse, and writes nothing in that case: a wrong range list pins the
+    wrong bytes, which is worse than pinning nothing.
+  * The perf HUD shows "waiting N park/s M fill/s". Parks = the guest gave up
+    its turn on a clock that had not ticked; fills = it was blocked on a lazy
+    chunk. The two need different fixes, and which is nonzero names the bug.
+  * Tests: test-mbaa-texture-census.js, test-perf-hud-waiting.js.
+---
+ docs/silent-handler-inventory.md       |  15 ++
+ host.js                                |  26 +-
+ lib/app-files.js                       | 136 ++++++++++-
+ lib/apps.js                            |  22 ++
+ lib/browser-shell.js                   |  20 +-
+ lib/d3d9-host.js                       | 322 +++++++++++++++++--------
+ lib/filesystem.js                      |  21 +-
+ lib/host-imports.js                    |   6 +
+ lib/perf-hud.js                        |  46 +++-
+ src/01-header.wat                      |   5 +
+ src/09a7d-handlers-shell-file.wat      |   9 +
+ src/09ad-handlers-d3d9.wat             |  84 ++++++-
+ src/13-exports.wat                     |  21 ++
+ test/test-app-files-policy.js          | 106 +++++++-
+ test/test-app-files-switches.js        |  79 ++++++
+ test/test-d3d9-p8-conversion.js        | 152 ++++++++++++
+ test/test-d3d9-palette-state.js        | 154 ++++++++++++
+ test/test-d3d9-texture-argb4444.js     |   6 +-
+ test/test-d3d9-textures.js             |  14 +-
+ test/test-mbaa-texture-census.js       | 164 +++++++++++++
+ test/test-perf-hud-waiting.js          | 106 ++++++++
+ test/test-readfile-park-idempotence.js | 133 ++++++++++
+ tools/check-silent-stubs.js            |   4 +-
+ tools/mbaa-texture-census.js           | 273 +++++++++++++++++++++
+ 24 files changed, 1804 insertions(+), 120 deletions(-)
+ create mode 100644 test/test-app-files-switches.js
+ create mode 100644 test/test-d3d9-p8-conversion.js
+ create mode 100644 test/test-d3d9-palette-state.js
+ create mode 100644 test/test-mbaa-texture-census.js
+ create mode 100644 test/test-perf-hud-waiting.js
+ create mode 100644 test/test-readfile-park-idempotence.js
+ create mode 100644 tools/mbaa-texture-census.js
+
+diff --git a/docs/silent-handler-inventory.md b/docs/silent-handler-inventory.md
+index 1f536e8d0..96b196ce9 100644
+--- a/docs/silent-handler-inventory.md
++++ b/docs/silent-handler-inventory.md
+@@ -789,3 +789,18 @@ The software RGB565 candidate changes IDirect3D9::CheckDeviceFormatConversion
+ from unconditional success to rejecting conversions involving format23, which
+ StretchRect does not implement. The existing BGRA8 behavior is unchanged.
+ This removes one straight-line handler from the inventory:243 to242.
++
++### 2026-11-17: D3D9 texture palettes are real state
++
++242 -> 243 is the reverse direction, and it is a *metadata* stub being retired
++rather than a manual one added: `SetPaletteEntries`, `GetPaletteEntries`,
++`SetCurrentTexturePalette` and `GetCurrentTexturePalette` were straight-line
++returns (two of them through `$crash_unimplemented`), so an indexed
++(`D3DFMT_P8`) game was told "yes, palettes work" and then got a texture whose
++texels were the palette INDICES uploaded as greyscale — the white/light-grey
++sprite report. The device state now carries the 16 D3D9 palettes (256
++D3DCOLOR each) at `state+25620` and the current palette number at `state+25616`
++inside a 42000-byte allocation; the four handlers copy/store and
++`lib/d3d9-host.js` expands P8 through the palette that is current at upload
++time. The inventory count moves because four handlers are no longer quiet
++bodies; the digest is re-pinned by `node tools/check-silent-stubs.js --print`.
+diff --git a/host.js b/host.js
+index 39683d157..3ed33051f 100644
+--- a/host.js
++++ b/host.js
+@@ -642,6 +642,16 @@ class WineAssembly {
+   // Satisfy a guest read parked on a lazy byte range (io_wait), on whichever
+   // guest thread parked it. Game data fetched over HTTP ranges (a provider
+   // loadFiles marked `gameData`) gets the in-game wait window
++  // Mirror the fill counter into the guest so the HUD samples it in the same
++  // readExports round trip as the spin counters. Best-effort: a worker guest
++  // has no synchronous export call, and the counter is diagnostic only.
++  _publishLazyFills() {
++    const ex = this.instance && this.instance.exports;
++    const set = ex && ex.set_lazy_fill_count;
++    if (typeof set !== 'function') return;
++    try { set(this._lazyFills >>> 0); } catch (_) { /* diagnostic only */ }
++  }
++
+   // (lib/game-wait.js): nothing for a wait under 500 ms, a Loading window
+   // after that, and on a fetch that still fails after two quiet retries a
+   // Retry/Quit question while the guest stays parked on the same call. Any
+@@ -649,6 +659,13 @@ class WineAssembly {
+   // failed fill becomes ERROR_READ_FAULT for the guest.
+   async _fillParkedRead(vfs, pending) {
+     this.logToUI(`[_fillParkedRead] ${pending && pending.path} off=${pending && pending.offset} len=${pending && pending.length}`);
++    // One count per guest-visible stall on a chunk that was not resident. This
++    // is the "first menu visit is slow, later visits are fine" half of the
++    // 20 FPS report: the frame is not slow, it is waiting for its own art. The
++    // number is published into the guest (see set_lazy_fill_count) so a single
++    // readExports in the perf HUD carries it beside the park counters.
++    this._lazyFills = (this._lazyFills || 0) + 1;
++    this._publishLazyFills();
+     const cache = pending && pending.provider;
+     const GW = typeof window !== 'undefined' && window.GameWait;
+     if (!cache || !cache.gameData || typeof cache.fill !== 'function') {
+@@ -3946,7 +3963,14 @@ class WineAssembly {
+       if (!['required', 'lazy', 'background'].includes(item.loadMode)) throw new Error('Invalid asset loadMode: ' + item.loadMode);
+       if (item.loadMode === 'required' && item.optional) throw new Error('Required manifest asset cannot be optional: ' + item.url);
+       if (!Number.isSafeInteger(item.size) || item.size < 0) throw new Error('Invalid manifest size: ' + item.url);
+-      if (item.loadMode !== 'required' && (item.decodeImage || item.preloadRanges)) throw new Error('Lazy manifest cannot require synchronous image decode or preload ranges: ' + item.url);
++      // `preloadRanges` is the WHOLE POINT of a lazy file here: the ranges the
++      // guest reads where it cannot park are fetched during the launch and
++      // stay resident, and the rest of the file streams in play (see the
++      // preload block below, and lib/app-files.js's preloadAssets policy,
++      // which emits exactly `loadMode: 'lazy' + preloadRanges`). Rejecting the
++      // combination made the policy unreachable from the launch path.
++      // `decodeImage` stays required-only: it needs the whole file at once.
++      if (item.loadMode !== 'required' && item.decodeImage) throw new Error('Lazy manifest cannot require synchronous image decode: ' + item.url);
+       const identity = item.loadMode + ':' + item.size;
+       if (declarations.has(item.url) && declarations.get(item.url) !== identity) throw new Error('Conflicting manifest declarations: ' + item.url);
+       declarations.set(item.url, identity);
+diff --git a/lib/app-files.js b/lib/app-files.js
+index ab641f215..2e84ca638 100644
+--- a/lib/app-files.js
++++ b/lib/app-files.js
+@@ -28,12 +28,32 @@
+ //   5. a file whose size is unknown (no `size`, no sizeOf answer) -> eager
+ //   6. per file eager: an extension a synchronous consumer reads
+ //      (EAGER_EXTENSIONS), or a path app.persistFiles names (the guest
+-//      writes it)
++//      writes it), or a file app.requiredFiles names (rule 6b)
++//   6b. app.preloadAssets names the files that must be IN before the game
++//      takes its first frame -- sprite archives, stage archives. This is the
++//      per-file answer to "stream all the textures before the player is in
++//      the game" without making every byte of a 900MB archive a launch cost:
++//      a named file gets `loadMode: 'required'` (whole, with progress) or,
++//      when the app declares `preloadRanges` for it, a measured range list
++//      that host.js fetches during launch while the rest still streams.
++//      A required whole file must be mountable: host.js mounts a sized entry
++//      over one release part (ASSET_PART_SIZE) synchronously and discovers
++//      the .partNNN split with a HEAD above that, so both shapes work.
+ //   7. otherwise streamed: {httpRange:true, size}. host.js mounts a sized
+ //      entry up to one release part with no HEAD, and a host without Range
+ //      support hands its first read the whole file (acceptWhole).
+ (function () {
+   const APP_EAGER_BYTES = 16 * 1024 * 1024;
++  // Above this, a whole-file preload is worth a warning: it trades a launch
++  // the user can cancel for a download they may not have asked for.
++  const PRELOAD_WHOLE_WARN_BYTES = 64 * 1024 * 1024;
++
++  // The name a warning should call a file: the URL leaf, which is what the
++  // user sees in the launch window.
++  function leafOf(file) {
++    const url = fileUrl(file);
++    return url ? url.replace(/^.*\//, '') : String(file && file.url || file);
++  }
+ 
+   // Read by something that cannot park on a cache miss: the PE/DLL loader
+   // (images, codecs, plug-ins, type libraries), resource and font loading,
+@@ -132,9 +152,44 @@
+       if (total < APP_EAGER_BYTES) return finish(list.slice(), 'eager: small app');
+     }
+     const persist = (app && Array.isArray(app.persistFiles) ? app.persistFiles : []).map(patternRegex);
++    // `preloadAssets` -> the set of vfs paths (or URL leaves) that must be in
++    // before the first frame. Matched the same loose way as persistFiles: a
++    // bare file name, a `c:\dir\file.p` path, or a URL leaf all work, because
++    // a registry entry's files are keyed by URL while the app author thinks in
++    // the guest's names.
++    const preload = preloadMatchers(app);
++    const rangeFor = rangeListFor(app);
++    // A preloaded file with no measured ranges costs its WHOLE size at launch.
++    // That is the right answer for a 20 MB archive and the wrong one for
++    // MBAACC's 900 MB sprite pack, and the difference is invisible until the
++    // launch window sits at 3% for ten minutes. Sum it here, warn once with
++    // the numbers, and keep going: refusing would turn a slow launch into no
++    // launch, and the caller may well be on a fast pipe.
++    let preloadWholeBytes = 0;
++    const preloadWhole = [];
+     const out = list.map((file, i) => {
+       if (!fileUrl(file) || declaresLoading(file)) return file;
+       const size = sizes[i];
++      const wanted = preload.length &&
++        preloadCandidates(file).some(path => preload.some(re => re.test(path)));
++      if (wanted) {
++        // Measured ranges: the app knows which bytes are textures, so only
++        // those are launch cost and the rest keeps streaming.
++        const ranges = rangeFor(file, size);
++        if (ranges) {
++          const base = typeof file === 'string' ? { url: file } : { ...file };
++          return { ...base, size, loadMode: 'lazy', preloadRanges: ranges };
++        }
++        // Whole file, with the launch window's progress and Cancel. `required`
++        // means a failure fails the launch instead of streaming on demand,
++        // which is the point: the guest caches a failed read as NULL forever.
++        if (typeof size === 'number') {
++          preloadWholeBytes += size;
++          preloadWhole.push(`${leafOf(file)} ${(size / (1024 * 1024)).toFixed(0)}MB`);
++        }
++        const base = typeof file === 'string' ? { url: file } : { ...file };
++        return { ...base, size, loadMode: 'required' };
++      }
+       // Unknown size: eager. An unsized entry is a registry the size map does
+       // not cover yet; it keeps the pre-policy behaviour rather than a guess
+       // (AoE II's unsized EULA.RTF streamed into a non-parking reader once).
+@@ -150,9 +205,88 @@
+       const base = typeof file === 'string' ? { url: file } : { ...file };
+       return { ...base, httpRange: true, size };
+     });
++    if (preloadWholeBytes > PRELOAD_WHOLE_WARN_BYTES) {
++      const total = `${(preloadWholeBytes / (1024 * 1024)).toFixed(0)}MB`;
++      console.warn(`[files] ${(app && app.id) || 'app'}: preloadAssets makes ${total} `
++        + `required at launch with no measured ranges (${preloadWhole.join(', ')}). `
++        + 'Run tools/mbaa-texture-census.js on these archives and declare '
++        + 'preloadRanges to preload only the bytes the guest reads before it can park.');
++      summary.preloadWholeBytes = preloadWholeBytes;
++    }
+     return finish(out, 'lazy');
+   }
+ 
++  // `preloadAssets` entries name files the same way `persistFiles` does, plus
++  // the two names an app author actually has in hand: the guest path
++  // (`c:\0002.p`) and the published URL leaf (`0002.p`, or `0002.p.part000`
++  // in a deploy tree). A trailing `/` or a bare name with no dot is read as a
++  // prefix, so `assets/raw/MBAACC/` preloads the whole tree.
++  function preloadMatchers(app) {
++    const list = app && Array.isArray(app.preloadAssets) ? app.preloadAssets.slice() : [];
++    // A manifest may carry its own textures list (the app tree travels with
++    // the media, so the list belongs beside it): `preloadAssets` at the top
++    // level, or `registry.preloadAssets`. Both are just more names.
++    if (app && app._localManifestPreload && Array.isArray(app._localManifestPreload))
++      list.push(...app._localManifestPreload);
++    return list.filter(item => typeof item === 'string' && item)
++      .map(item => preloadMatcher(item));
++    // An entry with a separator in it is a URL or a repo path, not a guest
++    // path, and no files[] entry's VFS path contains that prefix: it matches
++    // the END of the candidate instead. A directory (trailing separator) or
++    // anything with a wildcard matches a tail-prefix, so `assets/raw/MBAACC/`
++    // takes the whole tree. A bare leaf keeps the exact-path rule shared with
++    // persistFiles, where the author really does mean the guest's path.
++    function preloadMatcher(item) {
++      const escape = text => text.replace(/[.+^${}()|[\]\\]/g, '\\$&')
++        .replace(/\*/g, '.*').replace(/\?/g, '.');
++      if (!/[\\/]/.test(item)) return patternRegex(item);
++      const dir = /[\\/]$/.test(item);
++      const tail = normalizePath(item).replace(/^[a-z]:\\?/, '');
++      const body = escape(tail) + (dir ? '.*' : '');
++      return new RegExp('(?:^|[\\\\/])' + body + '$');
++    }
++  }
++  // A preloadAssets entry is authored by a human, so it may name the file by
++  // its guest path (c:\0002.p), by its published URL (assets/raw/MBAACC/0002.p)
++  // or by leaf alone (0002.p). The VFS paths a files[] entry carries are NOT
++  // the URL: matching one against the other silently preloads nothing, which
++  // is why the URL leaf and the raw URL are both candidates here.
++  function preloadCandidates(file) {
++    const paths = vfsPathsOf(file);
++    const url = fileUrl(file);
++    // Every name the author might have written for this file. The URL leaf,
++    // the URL itself, and the guest path the URL WOULD map to when it keeps
++    // its directories (`assets/raw/MBAACC/0002.p` -> `c:\\assets\\raw\\mbaacc\\0002.p`)
++    // are all legitimate spellings, and matching only the VFS path silently
++    // preloads nothing for a registry whose vfsPath is flattened.
++    paths.push(url.toLowerCase().replace(/^.*\//, ''));
++    paths.push(url.toLowerCase());
++    paths.push(normalizePath(url));
++    if (typeof file === 'object' && file && Array.isArray(file.vfsPaths))
++      for (const path of file.vfsPaths) paths.push(String(path).toLowerCase());
++    return paths;
++  }
++  // `preloadRanges` on the APP is an object keyed by file, or a function
++  // (file, size) -> ranges. Ranges may be the {schemaVersion, size, ranges}
++  // object tools/io-range-census.js --emit writes, or a bare array of pairs.
++  // A list measured against a different size is refused here rather than at
++  // mount time: pinning the wrong bytes is worse than not preloading.
++  function rangeListFor(app) {
++    const table = app && app.preloadRanges;
++    if (!table) return () => null;
++    return (file, size) => {
++      const leaf = fileUrl(file).replace(/[?#].*$/, '').replace(/^.*[\\/]/, '');
++      const value = typeof table === 'function' ? table(file, size)
++        : (table[leaf] || table[fileUrl(file)] || null);
++      if (!value) return null;
++      const list = Array.isArray(value) ? value : value.ranges;
++      if (!Array.isArray(list) || !list.length) return null;
++      if (!Array.isArray(value) && Number.isSafeInteger(value.size) &&
++          Number.isSafeInteger(size) && value.size !== size) return null;
++      return { schemaVersion: 1, ...(Number.isSafeInteger(size) ? { size } : {}), ranges: list };
++    };
++  }
++
+   // A registry entry can carry `iniSet: {Section: {Key: 'value'}}` to change
+   // keys in a mounted INI file -- what a player does in the game's own
+   // settings screen, decided once in the registry so both hosts mount the
+diff --git a/lib/apps.js b/lib/apps.js
+index d9d6a42e5..669ee6bab 100644
+--- a/lib/apps.js
++++ b/lib/apps.js
+@@ -1601,6 +1601,28 @@
+         d3d9Programmable: true,
+         bigMemory: true,
+         threads: false,
++        // THE STREAMING PROBLEM, stated as policy (docs/mbaa/AUDIT_2026-11-17.md
++        // reports 1, 2 and 5). MBAACC's archives are 0000..0006.p; the two that
++        // hold every sprite and every stage tile are 0002.p and 0003.p, and both
++        // are far over APP_EAGER_BYTES, so they stream and every in-battle miss
++        // is either a Loading window or -- worse -- a read the game caches as
++        // NULL forever (GitHub issue #1: a battle with no characters, a black
++        // stage in every round after).
++        //
++        // `preloadAssets` makes those two part of the LAUNCH, so the player
++        // cannot enter a battle whose textures are still on the server. Two
++        // shapes, and which one is right is a size question:
++        //   * as written, each named archive is fetched whole before the first
++        //     frame (loadMode 'required'): launch progress, launch failure,
++        //     no silent mid-battle stream. ~1GB with the two archives.
++        //   * a `.wine-assembly-browser.json` (or this entry) may also carry
++        //     `preloadRanges` for an archive, measured with
++        //     `node tools/mbaa-texture-census.js`; then only those ranges load
++        //     at launch and the rest still streams (a few tens of MB).
++        // Delete an entry to put that archive back on demand. The manifest is
++        // the better place for a deployed build: the sizes belong with the
++        // bytes.
++        preloadAssets: ['0002.p', '0003.p'],
+       },
+       // Original InstallShield payload plus its original loose-file overlays.
+       // Locally installed media only; no public desktop or synthesized settings.
+diff --git a/lib/browser-shell.js b/lib/browser-shell.js
+index 61779ef5f..9c75d1ac8 100644
+--- a/lib/browser-shell.js
++++ b/lib/browser-shell.js
+@@ -3180,6 +3180,13 @@
+           url: new URL(file.url, manifestUrl).href,
+         }));
+         app.files = [...(app.files || []), ...resolved];
++        // A manifest can say which of its own files must be resident before
++        // the first frame (lib/app-files.js `preloadAssets`); the registry
++        // entry may also name them. Union, so either place works.
++        if (Array.isArray(local.preloadAssets) && local.preloadAssets.length)
++          app._localManifestPreload = local.preloadAssets.slice();
++        if (local.preloadRanges && typeof local.preloadRanges === 'object')
++          app.preloadRanges = { ...(local.preloadRanges), ...(app.preloadRanges || {}) };
+         app._localRegistry = local.registry || null;
+         app._localFilesResolved = true;
+         if (app.cdAudio && !app.cdAudio.trackSizes) {
+@@ -3350,9 +3357,20 @@
+           // ?eager-files loads everything up front, as before the policy: the
+           // control arm for measuring it, and a debugging opt-out.
+           const eagerFilesParam = /[?&]eager-files(?:[=&]|$)/.test(location.search);
++          // ?lazy-files is the opposite opt-out, and it exists because the two
++          // are not symmetric any more: preloadAssets can make a launch wait
++          // for a gigabyte (lib/app-files.js warns when it does), and someone
++          // on a slow link needs a way to say "just stream it" without editing
++          // the registry. It clears the preload declarations for this launch
++          // only; everything else about the policy is unchanged.
++          const lazyFilesParam = /[?&]lazy-files(?:[=&]|$)/.test(location.search);
+           if (window.appFiles && window.byteProvider && !eagerFilesParam) {
+             const isWin16 = wine.hasGuestExport('is_win16') ? !!(await wine.callGuest('is_win16')) : false;
+-            const policy = window.appFiles.normalizeLazyFiles(app, app.files, {
++            const policyApp = lazyFilesParam
++              ? { ...app, preloadAssets: [], preloadRanges: undefined }
++              : app;
++            if (lazyFilesParam) log.textContent += '?lazy-files: preloadAssets ignored for this launch\n';
++            const policy = window.appFiles.normalizeLazyFiles(policyApp, app.files, {
+               isWin16,
+             });
+             files = policy.files;
+diff --git a/lib/d3d9-host.js b/lib/d3d9-host.js
+index ddc7a18d3..6b12261d4 100644
+--- a/lib/d3d9-host.js
++++ b/lib/d3d9-host.js
+@@ -118,6 +118,128 @@
+     return new Uint8Array(scratch[key], 0, n);
+   }
+ 
++
++  // ---- texture texel conversion ---------------------------------------------
++  //
++  // One pure function, exported, because this is the layer that turned guest
++  // bytes into the pixels a sampler reads and the "white sprite" report lives
++  // or dies here. Kept pure so a test can call it with a hand-built source
++  // instead of standing up a GL context: see test/test-d3d9-p8-conversion.js.
++  //
++  // `palette` is the 256-entry D3DCOLOR table for D3DFMT_P8 and is ignored by
++  // every other format.
++  function decodeTexturePixels(format, src, w, h, palette) {
++    if (palette === undefined) palette = null;
++    let pixels;
++    if(format===Texture.DXT1||format===Texture.DXT3||format===Texture.DXT5)pixels=Texture.decode(src,w,h,format);
++    else if(format===20){
++      // R8G8B8: three bytes per texel, stored blue first like every
++      // other D3D9 xRGB layout, with no alpha channel to read.
++      if(src.length!==w*h*3)throw new Error('invalid texture byte length');
++      pixels=new Uint8Array(w*h*4);
++      for(let i=0,o=0;i<src.length;i+=3,o+=4){
++        pixels[o]=src[i+2];pixels[o+1]=src[i+1];pixels[o+2]=src[i];pixels[o+3]=255;
++      }
++    }
++    else if(format===23){
++      // R5G6B5: each channel is replicated into its high bits so that
++      // an all-ones field reaches 255 rather than 248.
++      if(src.length!==w*h*2)throw new Error('invalid texture byte length');
++      pixels=new Uint8Array(w*h*4);
++      for(let i=0,o=0;i<src.length;i+=2,o+=4){
++        const v=src[i]|(src[i+1]<<8),r=(v>>>11)&31,g=(v>>>5)&63,b=v&31;
++        pixels[o]=(r<<3)|(r>>>2);pixels[o+1]=(g<<2)|(g>>>4);pixels[o+2]=(b<<3)|(b>>>2);
++        pixels[o+3]=255;
++      }
++    }
++    else if(format===24||format===25){
++      // X1R5G5B5 / A1R5G5B5: five bits a channel, replicated into the
++      // high bits; the top bit is alpha for A1 and ignored (opaque)
++      // for X1. LithTech (Die Hard: Nakatomi Plaza) keys its 16-bit
++      // textures with A1R5G5B5.
++      if(src.length!==w*h*2)throw new Error('invalid texture byte length');
++      pixels=new Uint8Array(w*h*4);
++      for(let i=0,o=0;i<src.length;i+=2,o+=4){
++        const v=src[i]|(src[i+1]<<8),r=(v>>>10)&31,g=(v>>>5)&31,b=v&31;
++        pixels[o]=(r<<3)|(r>>>2);pixels[o+1]=(g<<3)|(g>>>2);pixels[o+2]=(b<<3)|(b>>>2);
++        pixels[o+3]=format===25?((v>>>15)?255:0):255;
++      }
++    }
++    else if(format===26){
++      // A4R4G4B4: each nibble times 17 spans 0..255 exactly. The create
++      // gate ($d3d9_texture_format_supported) admits it, so it has to
++      // be sampled here too -- B&W2 and Morrowind's main menu both bind one.
++      if(src.length!==w*h*2)throw new Error('invalid texture byte length');
++      pixels=new Uint8Array(w*h*4);
++      for(let i=0,o=0;i<src.length;i+=2,o+=4){
++        const v=src[i]|(src[i+1]<<8);
++        pixels[o]=((v>>>8)&15)*17;pixels[o+1]=((v>>>4)&15)*17;pixels[o+2]=(v&15)*17;
++        pixels[o+3]=(v>>>12)*17;
++      }
++    }
++    else if(format===50||format===81){
++      // L8 and L16 carry luminance only. A sampler reads it on all
++      // three colour channels with alpha opaque; L16 keeps its high
++      // byte, which is what an 8-bit-per-channel sampler can show.
++      const texel=format===50?1:2;
++      if(src.length!==w*h*texel)throw new Error('invalid texture byte length');
++      pixels=new Uint8Array(w*h*4);
++      for(let i=0,o=0;i<src.length;i+=texel,o+=4){
++        pixels[o]=pixels[o+1]=pixels[o+2]=src[i+texel-1];pixels[o+3]=255;
++      }
++    }
++    else if(format===28){
++      // D3DFMT_A8: one byte per texel, carrying alpha channel only.
++      // Sampler reads color as white (or replicates), with alpha from source.
++      if(src.length!==w*h)throw new Error('invalid texture byte length');
++      pixels=new Uint8Array(w*h*4);
++      for(let i=0,o=0;i<src.length;i++,o+=4){
++        pixels[o]=pixels[o+1]=pixels[o+2]=255;pixels[o+3]=src[i];
++      }
++    }
++    else if(format===41){
++      // D3DFMT_P8: one byte per texel, an index into the device's
++      // CURRENT texture palette (D3D9 semantic: the palette in effect
++      // when the texture is used). This used to upload the index as
++      // luminance, which renders a bright/white sprite whose real
++      // palette never applied -- the "white placeholder texture"
++      // report. The palette lives in guest device state at +25620,
++      // 1024 bytes per palette, selected by +25616; see the D3D9
++      // palette handlers in src/09ad-handlers-d3d9.wat.
++      if(src.length!==w*h)throw new Error('invalid texture byte length');
++      // No palette supplied is a caller bug, and a silent fallback here is
++      // what produced grey sprites: refuse instead of inventing pixels.
++      if(!palette)throw new Error('D3DFMT_P8 upload without a palette');
++      pixels=new Uint8Array(w*h*4);
++      for(let i=0,o=0;i<src.length;i++,o+=4){
++        // D3DCOLOR is 0xAARRGGBB; the sampler wants RGBA bytes.
++        const c=palette[src[i]],a=(c>>>24)&255;
++        pixels[o]=(c>>>16)&255;pixels[o+1]=(c>>>8)&255;pixels[o+2]=c&255;
++        // An all-zero palette entry is "never set". Treat it as the
++        // opaque black Win32 would show rather than as invisible:
++        // a cleared palette must not turn every sprite transparent.
++        // The test is on the RGB too: D3DCOLOR 0x00000000 and
++        // 0x00rrggbb both mean alpha 0, but only the former is unset.
++        pixels[o+3]=a===0&&c===0?255:a;
++      }
++    }
++    else if(format===51){
++      // A8L8: two bytes per texel, luminance low, alpha high. A sampler
++      // reads luminance on all three colour channels.
++      if(src.length!==w*h*2)throw new Error('invalid texture byte length');
++      pixels=new Uint8Array(w*h*4);
++      for(let i=0,o=0;i<src.length;i+=2,o+=4){
++        pixels[o]=pixels[o+1]=pixels[o+2]=src[i];pixels[o+3]=src[i+1];
++      }
++    }else{
++      if(src.length!==w*h*4)throw new Error('invalid texture byte length');
++      pixels=new Uint8Array(src.length);
++      if(format===62)pixels.set(src); // retain signed U/V and unsigned L bytes
++      else for(let i=0;i<src.length;i+=4){pixels[i]=src[i+2];pixels[i+1]=src[i+1];pixels[i+2]=src[i];pixels[i+3]=format===22?255:src[i+3];}
++    }
++  return pixels;
++  }
++
+   class Bridge {
+     constructor(options) {
+       this.options = options; this.devices = new Map(); this.lastError = null;
+@@ -164,6 +286,73 @@
+       // which is what every synchronous (non-worker) device does anyway.
+       this.maxDeferred = options.maxDeferredCommands === undefined ? 32 : options.maxDeferredCommands;
+       if (!Number.isSafeInteger(this.maxDeferred) || this.maxDeferred < 0) throw new Error('invalid D3D9 deferred command limit');
++      // ---- texture content audit -------------------------------------------
++      //
++      // A "white sprite" report has two very different causes and they are
++      // indistinguishable from a screenshot: the GAME may be uploading white
++      // (an asset that never arrived, an unlocked/never-written region), or
++      // THIS conversion may be turning its data into white (a paletted format
++      // uploaded as greyscale of the index, a format that samples the wrong
++      // channel). Counting per uploaded level, by whether every texel is
++      // 0xFF/0x00, separates them with one number and no guessing.
++      //
++      // Off by default: the census is one pass over each NEW level (never a
++      // re-upload of a cached one), but a long session still uploads a lot of
++      // them, and the ordinary path should not pay for a diagnostic.
++      // Enable with `?d3d9-audit=textures` or `{ auditTextures: true }`.
++      this.auditTextures = options.auditTextures === true;
++      this.textureAudit = {
++        levels: 0, bytes: 0, white: 0, black: 0, transparent: 0, partialAlpha: 0,
++        byFormat: new Map(), samples: [],
++      };
++    }
++    // One level entering the snapshot cache. Cheap (a single linear pass) and
++    // deliberately ON THE CONVERTED RGBA, not the guest bytes: the question is
++    // what the sampler is about to read.
++    _auditTexture(entry) {
++      const audit = this.textureAudit, px = entry.pixels, n = px.length;
++      audit.levels++; audit.bytes += n;
++      let white = 0, black = 0, transparent = 0;
++      // Step over one texel's channels: sample every 4th byte to keep a 2048^2
++      // level under a few million iterations, and check alpha on all of them.
++      for (let i = 0; i < n; i += 4) {
++        const a = px[i + 3];
++        if (a === 0) { transparent++; continue; }
++        if (px[i] === 255 && px[i + 1] === 255 && px[i + 2] === 255) white++;
++        else if (px[i] === 0 && px[i + 1] === 0 && px[i + 2] === 0) black++;
++      }
++      const texels = n / 4;
++      // "White" means every opaque texel is full white: the actual symptom.
++      if (transparent === texels) audit.transparent++;
++      else if (white === texels - transparent && white) audit.white++;
++      else if (black === texels - transparent && black) audit.black++;
++      if (transparent && transparent !== texels) audit.partialAlpha++;
++      const key = entry.format;
++      const bucket = audit.byFormat.get(key) || { levels: 0, white: 0, black: 0, transparent: 0 };
++      bucket.levels++;
++      if (transparent === texels) bucket.transparent++;
++      else if (white === texels - transparent && white) bucket.white++;
++      else if (black === texels - transparent && black) bucket.black++;
++      audit.byFormat.set(key, bucket);
++      if (audit.samples.length < 32 && (transparent === texels ||
++          (white === texels - transparent && white) ||
++          (black === texels - transparent && black))) {
++        audit.samples.push({ width: entry.width, height: entry.height,
++          format: entry.format, guest: '0x' + (entry.key >>> 0).toString(16),
++          kind: transparent === texels ? 'transparent'
++            : (white === texels - transparent ? 'white' : 'black') });
++      }
++    }
++    // A one-line summary a HUD or the page log can show.
++    textureAuditSummary() {
++      const a = this.textureAudit;
++      const parts = [`${a.levels} levels`, `${(a.bytes / 1048576).toFixed(1)}MB`,
++        `white ${a.white}`, `black ${a.black}`, `cleared ${a.transparent}`];
++      for (const [format, bucket] of a.byFormat) {
++        if (bucket.white || bucket.black || bucket.transparent)
++          parts.push(`fmt${format}: ${bucket.levels} (w${bucket.white} b${bucket.black} c${bucket.transparent})`);
++      }
++      return parts.join(' | ');
+     }
+     get sharedWorker() {
+       return typeof this.options.createRenderWorker==='function' &&
+@@ -188,6 +377,8 @@
+       if (previous) { this._textureSnapshots.delete(key); this._textureSnapshotBytes -= previous.pixels.byteLength; }
+       if (bytes > this.maxTextureSnapshotBytes) return null;
+       entry.bytes = bytes;
++      entry.key = key;
++      if (this.auditTextures) this._auditTexture(entry);
+       // The serial is the level's identity on the executor side: new content
+       // at the same guest address is a new snapshot and a new key, so a
+       // resident copy can never be mistaken for it.
+@@ -1228,6 +1419,36 @@
+           attributes.push({register:7+i,usage:5,usageIndex:i,type:size-1,offset});offset+=size*4;}
+         if(offset>packedStride)throw new Error('FVF exceeds vertex stride');
+         }
++        // P8 resolution reads the palette CURRENT when this upload happens,
++        // which is exactly D3D9's rule for a texture drawn with
++        // SetCurrentTexturePalette in effect. Clamped rather than rejected:
++        // D3D9 docs say an out-of-range number selects the system palette,
++        // and no app has been measured relying on that, so the nearest
++        // defined palette is the honest approximation.
++        //
++        // THE CACHE KEY has to know about the palette, or the first frame's
++        // expansion is reused forever and a sprite whose palette is loaded
++        // after its first draw stays white. So the snapshot's `mark` is the
++        // palette-table hash for P8 rather than a hash of the index bytes,
++        // and the same-generation fast path is skipped for the format.
++        const paletteOf = (state) => {
++          const selected=u32(state+25616);
++          const index=Math.min(15, Math.max(0, selected|0));
++          const at=g2w(state+25620+index*1024);
++          const table=new Uint32Array(256);
++          for(let i=0;i<256;i++) table[i]=view.getUint32(at+i*4,true);
++          return table;
++        };
++        // FNV-1a over the resolved table, folded into the same 4-word shape
++        // sameFingerprint() compares so the P8 branch needs no new field.
++        const paletteMark = (table) => {
++          let h=0x811c9dc5;
++          for(let i=0;i<256;i++){
++            h^=table[i];h=Math.imul(h,0x01000193);
++            h^=table[i]>>>16;h=Math.imul(h,0x01000193);
++          }
++          return new Uint32Array([h,table[0],table[255],0x50380000]);
++        };
+         const textures=[],plan={uses:new Set(),added:[],addedBytes:0,releases:[]};
+         // Bumped by every texture this device creates: a mip record address
+         // can only name a new texture after it moves (see sameFingerprint).
+@@ -1255,10 +1476,12 @@
+             const src=new Uint8Array(memory,g2w(bits),byteLength);
+             const snapshots=this._textureSnapshots;
+             const cached=snapshots.get(m);
++            const p8Table=format===41?paletteOf(program):null;
+             if(cached&&cached.seq===seq&&cached.bits===bits&&cached.byteLength===byteLength
+               &&cached.format===format&&cached.width===w&&cached.height===h
+-              &&(cached.device===entry&&cached.generation===textureGeneration
+-                ||sameFingerprint(cached.mark,src))){
++              &&(p8Table?sameFingerprint(cached.mark,paletteMark(p8Table))
++                :(cached.device===entry&&cached.generation===textureGeneration
++                  ||sameFingerprint(cached.mark,src)))){
+               cached.device=entry;cached.generation=textureGeneration;
+               // Touch for recency: the Map's insertion order is the eviction
+               // order, so a level in use every frame must not age out behind
+@@ -1268,98 +1491,9 @@
+               continue;
+             }
+             reserve(w * h * 4);
+-            let pixels;
+-            if(format===Texture.DXT1||format===Texture.DXT3||format===Texture.DXT5)pixels=Texture.decode(src,w,h,format);
+-            else if(format===20){
+-              // R8G8B8: three bytes per texel, stored blue first like every
+-              // other D3D9 xRGB layout, with no alpha channel to read.
+-              if(src.length!==w*h*3)throw new Error('invalid texture byte length');
+-              pixels=new Uint8Array(w*h*4);
+-              for(let i=0,o=0;i<src.length;i+=3,o+=4){
+-                pixels[o]=src[i+2];pixels[o+1]=src[i+1];pixels[o+2]=src[i];pixels[o+3]=255;
+-              }
+-            }
+-            else if(format===23){
+-              // R5G6B5: each channel is replicated into its high bits so that
+-              // an all-ones field reaches 255 rather than 248.
+-              if(src.length!==w*h*2)throw new Error('invalid texture byte length');
+-              pixels=new Uint8Array(w*h*4);
+-              for(let i=0,o=0;i<src.length;i+=2,o+=4){
+-                const v=src[i]|(src[i+1]<<8),r=(v>>>11)&31,g=(v>>>5)&63,b=v&31;
+-                pixels[o]=(r<<3)|(r>>>2);pixels[o+1]=(g<<2)|(g>>>4);pixels[o+2]=(b<<3)|(b>>>2);
+-                pixels[o+3]=255;
+-              }
+-            }
+-            else if(format===24||format===25){
+-              // X1R5G5B5 / A1R5G5B5: five bits a channel, replicated into the
+-              // high bits; the top bit is alpha for A1 and ignored (opaque)
+-              // for X1. LithTech (Die Hard: Nakatomi Plaza) keys its 16-bit
+-              // textures with A1R5G5B5.
+-              if(src.length!==w*h*2)throw new Error('invalid texture byte length');
+-              pixels=new Uint8Array(w*h*4);
+-              for(let i=0,o=0;i<src.length;i+=2,o+=4){
+-                const v=src[i]|(src[i+1]<<8),r=(v>>>10)&31,g=(v>>>5)&31,b=v&31;
+-                pixels[o]=(r<<3)|(r>>>2);pixels[o+1]=(g<<3)|(g>>>2);pixels[o+2]=(b<<3)|(b>>>2);
+-                pixels[o+3]=format===25?((v>>>15)?255:0):255;
+-              }
+-            }
+-            else if(format===26){
+-              // A4R4G4B4: each nibble times 17 spans 0..255 exactly. The create
+-              // gate ($d3d9_texture_format_supported) admits it, so it has to
+-              // be sampled here too -- B&W2 and Morrowind's main menu both bind one.
+-              if(src.length!==w*h*2)throw new Error('invalid texture byte length');
+-              pixels=new Uint8Array(w*h*4);
+-              for(let i=0,o=0;i<src.length;i+=2,o+=4){
+-                const v=src[i]|(src[i+1]<<8);
+-                pixels[o]=((v>>>8)&15)*17;pixels[o+1]=((v>>>4)&15)*17;pixels[o+2]=(v&15)*17;
+-                pixels[o+3]=(v>>>12)*17;
+-              }
+-            }
+-            else if(format===50||format===81){
+-              // L8 and L16 carry luminance only. A sampler reads it on all
+-              // three colour channels with alpha opaque; L16 keeps its high
+-              // byte, which is what an 8-bit-per-channel sampler can show.
+-              const texel=format===50?1:2;
+-              if(src.length!==w*h*texel)throw new Error('invalid texture byte length');
+-              pixels=new Uint8Array(w*h*4);
+-              for(let i=0,o=0;i<src.length;i+=texel,o+=4){
+-                pixels[o]=pixels[o+1]=pixels[o+2]=src[i+texel-1];pixels[o+3]=255;
+-              }
+-            }
+-            else if(format===28){
+-              // D3DFMT_A8: one byte per texel, carrying alpha channel only.
+-              // Sampler reads color as white (or replicates), with alpha from source.
+-              if(src.length!==w*h)throw new Error('invalid texture byte length');
+-              pixels=new Uint8Array(w*h*4);
+-              for(let i=0,o=0;i<src.length;i++,o+=4){
+-                pixels[o]=pixels[o+1]=pixels[o+2]=255;pixels[o+3]=src[i];
+-              }
+-            }
+-            else if(format===41){
+-              // D3DFMT_P8: one byte per texel indexed/paletted.
+-              if(src.length!==w*h)throw new Error('invalid texture byte length');
+-              pixels=new Uint8Array(w*h*4);
+-              for(let i=0,o=0;i<src.length;i++,o+=4){
+-                const v=src[i];
+-                pixels[o]=pixels[o+1]=pixels[o+2]=v;pixels[o+3]=255;
+-              }
+-            }
+-            else if(format===51){
+-              // A8L8: two bytes per texel, luminance low, alpha high. A sampler
+-              // reads luminance on all three colour channels.
+-              if(src.length!==w*h*2)throw new Error('invalid texture byte length');
+-              pixels=new Uint8Array(w*h*4);
+-              for(let i=0,o=0;i<src.length;i+=2,o+=4){
+-                pixels[o]=pixels[o+1]=pixels[o+2]=src[i];pixels[o+3]=src[i+1];
+-              }
+-            }else{
+-              if(src.length!==w*h*4)throw new Error('invalid texture byte length');
+-              pixels=new Uint8Array(src.length);
+-              if(format===62)pixels.set(src); // retain signed U/V and unsigned L bytes
+-              else for(let i=0;i<src.length;i+=4){pixels[i]=src[i+2];pixels[i+1]=src[i+1];pixels[i+2]=src[i];pixels[i+3]=format===22?255:src[i+3];}
+-            }
++            const pixels = decodeTexturePixels(format, src, w, h, p8Table);
+             const kept=this._rememberTexture(m,{seq,bits,byteLength,format,width:w,height:h,
+-              pixels,mark:fingerprint(src),device:entry,generation:textureGeneration});
++              pixels,mark:p8Table?paletteMark(p8Table):fingerprint(src),device:entry,generation:textureGeneration});
+             levels.push(kept?this._residentLevel(entry,kept,plan,null):{width:w,height:h,pixels});
+           }
+           faces.push({...levels[0],levels});
+@@ -1487,5 +1621,5 @@
+       }
+     }
+   }
+-  return { Bridge };
++  return { Bridge, decodeTexturePixels };
+ });
+diff --git a/lib/filesystem.js b/lib/filesystem.js
+index bd9a8bfeb..3b0132040 100644
+--- a/lib/filesystem.js
++++ b/lib/filesystem.js
+@@ -2657,7 +2657,9 @@ function createFilesystemImports(ctx) {
+     // Keep pendingRead/readFault for legacy callers and the existing scheduler.
+     fs_read_file_result: (handle, bufGA, nToRead, nReadGA, threadId = 1) => {
+       const io = vfs.getIoState(threadId);
+-      if (nReadGA) gs32(nReadGA, 0);
++      // No entry-time zeroing of *lpBytesRead: every exit below writes either
++      // the real count or an explicit 0 for a failure, and an attempt that
++      // parks must leave the caller's slot alone (see the park path).
+       const accessError = fileDataAccessError(vfs.getOpenFile(handle), false);
+       if (accessError) {
+         io.pendingRead = null;
+@@ -2734,7 +2736,11 @@ function createFilesystemImports(ctx) {
+               fhPending.pos = startPos;
+             }
+             io.pendingRead = r.pending;
+-            if (nReadGA) gs32(nReadGA, 0);
++            // Deliberately NOT writing 0 to *lpBytesRead. The call is about to
++            // be re-entered from the top, so the slot must still say what it
++            // said before this call -- not a count from an attempt that never
++            // completed. (A nested run can deliver a callback while this call
++            // is parked, and that callback reads the guest's own variables.)
+             return 997;
+           }
+           if (!r.ok) { error = r.error || 30; break; }
+@@ -2762,7 +2768,12 @@ function createFilesystemImports(ctx) {
+       const io = vfs.getIoState(threadId);
+       io.pendingRead = null;
+       io.readFault = 0;
+-      if (nReadGA) gs32(nReadGA, 0);
++      // A parked read leaves NO trace the guest could observe: the call is
++      // going to be re-run from the top (WAT $io_block), so a zero here is not
++      // "the answer is 0", it is "this attempt did not complete". Writing it
++      // was safe only because the guest cannot look at the slot until the call
++      // returns -- and it can, through a callback the nested run may deliver.
++      // The success and error paths below still write the real value.
+       handle = handle >>> 0;
+       const fh = vfs.getOpenFile(handle);
+       if (!fh) return 6; // ERROR_INVALID_HANDLE
+@@ -2814,7 +2825,9 @@ function createFilesystemImports(ctx) {
+               bytesRead,
+             };
+             io.pendingRead = r.pending;
+-            if (nReadGA) gs32(nReadGA, 0);
++            // Same rule as fs_read_file: a park is not a completed call, so
++            // the guest's byte-count slot keeps its previous value until the
++            // retried call actually finishes.
+             return 997;
+           }
+           if (!r.ok) { error = r.error || 30; break; }
+diff --git a/lib/host-imports.js b/lib/host-imports.js
+index 859fb0d4b..fb37c5724 100644
+--- a/lib/host-imports.js
++++ b/lib/host-imports.js
+@@ -309,6 +309,12 @@ function createHostImports(ctx) {
+     shouldUseRenderWorker: () => ctx.sharedRenderWorkerEnabled === true,
+     getMemory: ctx.getMemory, guestToWasm: _guestToWasm, renderer: () => ctx.renderer,
+     createCanvas: ctx.createCanvas || null,
++    // Texture content census. Off unless asked for: `?d3d9-audit=textures`
++    // in the page, or ctx.auditTextures from a harness. It answers the one
++    // question a screenshot cannot -- whether a white sprite was uploaded
++    // white by the game or turned white here (lib/d3d9-host.js _auditTexture).
++    auditTextures: ctx.auditTextures === true || (typeof location !== 'undefined'
++      && /(?:^|[?&])d3d9-audit=textures(?:&|$)/.test(location.search)),
+     onPresent: layer => _noteGuestFrame({ kind: 'gpu', layer }),
+     onError: error => console.error(error.message),
+   }) : null);
+diff --git a/lib/perf-hud.js b/lib/perf-hud.js
+index 985fa8320..a0174ae1f 100644
+--- a/lib/perf-hud.js
++++ b/lib/perf-hud.js
+@@ -431,7 +431,13 @@
+       }
+       const names = ['get_loop_xlat_stosb_candidates',
+         'get_loop_xlat_stosb_matches', 'get_loop_xlat_stosb_runs',
+-        'get_loop_lut_runs'];
++        'get_loop_lut_runs',
++        // The two counters that answer "why is this menu 20 FPS" (GitHub
++        // issue #3). parks: the guest gave up its turn waiting for a clock
++        // that had not ticked -- a scheduler cost the app did not ask for.
++        // fills: the guest was blocked on a lazy chunk, i.e. it is still
++        // paying for asset streaming inside a frame.
++        'get_clock_spin_parks', 'get_peek_spin_parks', 'get_lazy_fill_count'];
+       if (hotBlocks) names.push('get_hot_block_hist_base',
+         'get_hot_block_hist_count', 'get_hot_block_hist_collisions');
+       let read = null;
+@@ -447,7 +453,8 @@
+       if (!read) return;
+       this._guestCounterBusy = true;
+       Promise.resolve(read).then(values => {
+-        this._guestCounters = { at: Date.now(), app: app.name, values };
++        const previous = this._guestCounters;
++        this._guestCounters = { at: Date.now(), app: app.name, values, previous };
+         if (hotBlocks) this._captureHotBlocks(wine, values);
+       }).catch(() => {}).finally(() => { this._guestCounterBusy = false; });
+     }
+@@ -563,6 +570,22 @@
+       return span > 0 ? (delta * 1000) / span : 0;
+     }
+ 
++    // Counter difference over the sample window, per second. Returns 0 rather
++    // than NaN when there is no previous sample or the window is degenerate,
++    // because this feeds a display that must never show "NaN/s".
++    _guestRate(name) {
++      const cur = this._guestCounters;
++      const prev = cur && cur.previous;
++      if (!cur || !prev || !prev.values) return 0;
++      const a = prev.values[name], b = cur.values[name];
++      if (typeof a !== 'number' || typeof b !== 'number') return 0;
++      const span = cur.at - prev.at;
++      if (!(span > 0)) return 0;
++      // Counters are i32 and may wrap; a difference is still correct modulo
++      // 2^32, and a wrapped negative would be the honest wrap reading.
++      return (((b >>> 0) - (a >>> 0)) >>> 0) * 1000 / span;
++    }
++
+     snapshot() {
+       // The ring also holds out-of-step present flushes (frameUpload). They
+       // count toward phase time, not toward step count or step latency.
+@@ -651,7 +674,12 @@
+       ].join(';');
+       const canvas = document.createElement('canvas');
+       canvas.width = 300;
+-      canvas.height = 168;
++      // 180, not 168: the graph block starts 12px lower than it used to
++      // because of the waiting line (waiting park/s + fill/s), and growing the
++      // canvas by the same 12px keeps every element's distance from the bottom
++      // edge -- the legend, the threads warning, the stream badge -- exactly
++      // as it was.
++      canvas.height = 180;
+       // index.html styles every <canvas> as the full-bleed screen surface,
+       // and its fullscreen rules do it with `height: 0 !important`. Inline
+       // styles lose to !important, so opt out with a rule of our own.
+@@ -739,6 +767,16 @@
+           + ` ${snap.input.takenPerSec.toFixed(0)}/s taken`
+           + `  age p50 ${snap.input.ageMs.p50.toFixed(1)} p99 ${snap.input.ageMs.p99.toFixed(1)}ms`, pad, 46);
+       }
++      // Waiting lines: where the emulated machine spent its frame NOT running
++      // guest code. Both are opt-in diagnostics (they need a counter sample),
++      // and both are red because a nonzero value while a menu is up is the
++      // reported 20 FPS, not a normal cost of doing business.
++      const parks = this._guestRate('get_clock_spin_parks') + this._guestRate('get_peek_spin_parks');
++      const fills = this._guestRate('get_lazy_fill_count');
++      if (parks > 0 || fills > 0) {
++        ctx.fillStyle = '#f87171';
++        ctx.fillText(`waiting ${parks.toFixed(0)} park/s ${fills.toFixed(0)} fill/s`, pad, 58);
++      }
+       // Which scheduler produced these numbers. Every timing here means
+       // something different between the cooperative scheduler and real
+       // threads, so a reading without the mode attached is not comparable.
+@@ -762,7 +800,7 @@
+       // The pointer line and optional logical-FPS line need reserved space:
+       // a graph that moves up and down as app hints or mouse traffic appear is
+       // unreadable.
+-      const g1y = 52, g1h = 50;
++      const g1y = 64, g1h = 50;
+       const steps = this.steps;
+       // Scale to the worst recent step, floored at 33ms so a healthy run
+       // does not get auto-scaled into looking dramatic.
+diff --git a/src/01-header.wat b/src/01-header.wat
+index 4a1c255b7..b4e2b616e 100644
+--- a/src/01-header.wat
++++ b/src/01-header.wat
+@@ -3366,6 +3366,11 @@
+   (global $clock_spin_parked_value (mut i32) (i32.const 0))
+   (global $clock_spin_parked_valid (mut i32) (i32.const 0))
+   (global $clock_spin_parks (mut i32) (i32.const 0))   ;; diagnostics: trips taken
++  ;; Lazy chunk fills this instance waited on. The HOST owns the counter (it
++  ;; is the one that talks to the provider) and publishes it here so a single
++  ;; readExport can show both halves of "why is this menu slow": parks/s is
++  ;; the guest spinning, fills/s is the guest blocked on its own assets.
++  (global $lazy_fill_count (mut i32) (i32.const 0))
+   (global $peek_spin_count (mut i32) (i32.const 0))
+   (global $peek_spin_seq (mut i32) (i32.const 0))
+   (global $peek_spin_ret (mut i32) (i32.const 0))
+diff --git a/src/09a7d-handlers-shell-file.wat b/src/09a7d-handlers-shell-file.wat
+index 084d78a1b..97f4446ae 100644
+--- a/src/09a7d-handlers-shell-file.wat
++++ b/src/09a7d-handlers-shell-file.wat
+@@ -917,6 +917,15 @@
+             (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 24)))
+             (return)))
+         (local.set $bytes (call $gl32 (i32.add (local.get $arg4) (i32.const 4))))
++        ;; Win32's contract for ReadFile is the count lands in BOTH places:
++        ;; *lpBytesRead when it is non-NULL, and OVERLAPPED.InternalHigh. This
++        ;; branch used to write only InternalHigh ("instead of into a scratch
++        ;; dword"), which is right for a completion-port read and wrong for
++        ;; every caller that passes both -- and a FILE_FLAG_OVERLAPPED handle
++        ;; with a real lpBytesRead is the normal shape. The guest then read
++        ;; whatever it had left in that slot: typically the PREVIOUS, shorter
++        ;; read's count, which is a truncated string that grows one character
++        ;; per frame -- the reported "The" / "Th" / "The..." dialogue.
+         (if (local.get $arg3) (then (call $gs32 (local.get $arg3) (local.get $bytes))))
+         ;; Set Internal to 0 (STATUS_SUCCESS)
+         (call $gs32 (local.get $arg4) (i32.const 0))
+diff --git a/src/09ad-handlers-d3d9.wat b/src/09ad-handlers-d3d9.wat
+index e5d4fafb0..1f7d9dcff 100644
+--- a/src/09ad-handlers-d3d9.wat
++++ b/src/09ad-handlers-d3d9.wat
+@@ -75,9 +75,14 @@
+     ;; +25600 actual backbuffer storage format, separate from display mode.
+     ;; +25604 D3D8 pixel-shader handle list; +25608 monotonic handle counter.
+     ;; +25612 D3D8 vertex-program/declaration handle list.
+-    (local.set $state (call $heap_alloc (i32.const 25616)))
++    ;; +25616 current texture palette number, +25620 the 16 texture palettes
++    ;; (256 D3DCOLOR each, 1024 bytes apiece) at +25620..+42003. A paletted
++    ;; texture is expanded with the palette that is CURRENT WHEN IT IS
++    ;; UPLOADED, which is what D3D9 does; the host asks for the whole block by
++    ;; guest address and never learns the layout.
++    (local.set $state (call $heap_alloc (i32.const 42000)))
+     (if (i32.eqz (local.get $state)) (then (return (i32.const 0))))
+-    (call $zero_memory (call $g2w (local.get $state)) (i32.const 25616))
++    (call $zero_memory (call $g2w (local.get $state)) (i32.const 42000))
+     (call $gs32 (i32.add (local.get $state) (i32.const 21780)) (global.get $current_thread_id))
+     (loop $texture_stages
+       (local.set $sampler (i32.add (call $g2w (local.get $state))
+@@ -1937,25 +1942,88 @@
+             (i32.store (local.get $out) (i32.const 1))))))))
+     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
+ 
+-  ;; IDirect3DDevice9_SetPaletteEntries — 3 args (incl. this)
++  ;; Palette storage inside the device state, as a guest address.
++  ;; SetPaletteEntries/GetPaletteEntries arrive BOTH ways in D3D9: the
++  ;; `Number` argument means `SetPaletteEntries(paletteNumber, entries)` and
++  ;; `GetPaletteEntries(paletteNumber, entries)` on this interface, so it is a
++  ;; palette index (0..15), not a DDSCAPS2 PALETTE flag as in DDraw.
++  (func $d3d9_palette_ptr (param $state i32) (param $number i32) (result i32)
++    (if (i32.or (i32.eqz (local.get $state)) (i32.ge_u (local.get $number) (i32.const 16)))
++      (then (return (i32.const 0))))
++    (i32.add (local.get $state)
++      (i32.add (i32.const 25620) (i32.mul (local.get $number) (i32.const 1024)))))
++
++  ;; IDirect3DDevice9_SetPaletteEntries — 3 args (incl. this):
++  ;;   SetPaletteEntries(paletteNumber, pEntries)
++  ;; A P8 texture samples these; returning success while storing nothing is
++  ;; what makes an indexed game render as luminance-of-index (grey/white)
++  ;; instead of its palette. A null entry pointer keeps D3D9's behaviour:
++  ;; success, no change.
+   (func $handle_IDirect3DDevice9_SetPaletteEntries (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
++    (local $state i32) (local $dest i32) (local $src i32) (local $i i32)
++    (local.set $state (call $d3d9_program_state (local.get $arg0)))
++    (if (i32.eqz (local.get $state)) (then
++      (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c))
++      (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
++      (return)))
++    (local.set $dest (call $d3d9_palette_ptr (local.get $state) (local.get $arg1)))
++    (if (i32.eqz (local.get $dest)) (then
++      (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c))
++      (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16)))
++      (return)))
++    (if (local.get $arg2) (then
++      (local.set $src (call $g2w (local.get $arg2)))
++      (loop $copy
++        (i32.store (i32.add (call $g2w (local.get $dest)) (i32.mul (local.get $i) (i32.const 4)))
++          (i32.load (i32.add (local.get $src) (i32.mul (local.get $i) (i32.const 4)))))
++        (local.set $i (i32.add (local.get $i) (i32.const 1)))
++        (br_if $copy (i32.lt_u (local.get $i) (i32.const 256))))))
+     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
+ 
+-  ;; IDirect3DDevice9_GetPaletteEntries — 3 args (incl. this)
++  ;; IDirect3DDevice9_GetPaletteEntries — 3 args (incl. this).
++  ;; The inverse of the above; a game that saves/restores palette state reads
++  ;; it back and must not crash.
+   (func $handle_IDirect3DDevice9_GetPaletteEntries (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+-    (call $crash_unimplemented (local.get $name_ptr))
++    (local $state i32) (local $src i32) (local $dest i32) (local $i i32)
++    (local.set $state (call $d3d9_program_state (local.get $arg0)))
++    (if (i32.eqz (local.get $state)) (then
++      (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c)) (return)))
++    (local.set $src (call $d3d9_palette_ptr (local.get $state) (local.get $arg1)))
++    (if (i32.eqz (local.get $src)) (then
++      (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c)) (return)))
++    (if (local.get $arg2) (then
++      (local.set $dest (call $g2w (local.get $arg2)))
++      (local.set $src (call $g2w (local.get $src)))
++      (loop $copy
++        (i32.store (i32.add (local.get $dest) (i32.mul (local.get $i) (i32.const 4)))
++          (i32.load (i32.add (local.get $src) (i32.mul (local.get $i) (i32.const 4)))))
++        (local.set $i (i32.add (local.get $i) (i32.const 1)))
++        (br_if $copy (i32.lt_u (local.get $i) (i32.const 256))))))
++    (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 16))))
+ 
+-  ;; IDirect3DDevice9_SetCurrentTexturePalette — 2 args (incl. this)
++  ;; IDirect3DDevice9_SetCurrentTexturePalette — 2 args (incl. this).
++  ;; Selects which palette the CURRENT P8 texture resolves against. D3D9
++  ;; clamps out-of-range numbers into the 16-entry table rather than failing.
+   (func $handle_IDirect3DDevice9_SetCurrentTexturePalette (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
++    (local $state i32)
+     (call $d3d9_recording_guard (local.get $arg0) (local.get $name_ptr))
++    (local.set $state (call $d3d9_program_state (local.get $arg0)))
++    (if (local.get $state) (then
++      (call $gs32 (i32.add (local.get $state) (i32.const 25616)) (local.get $arg1))))
+     (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
+ 
+-  ;; IDirect3DDevice9_GetCurrentTexturePalette — 2 args (incl. this)
++  ;; IDirect3DDevice9_GetCurrentTexturePalette — 2 args (incl. this).
+   (func $handle_IDirect3DDevice9_GetCurrentTexturePalette (param $arg0 i32) (param $arg1 i32) (param $arg2 i32) (param $arg3 i32) (param $arg4 i32) (param $name_ptr i32)
+-    (call $crash_unimplemented (local.get $name_ptr))
++    (local $state i32)
++    (local.set $state (call $d3d9_program_state (local.get $arg0)))
++    (if (i32.eqz (local.get $state)) (then
++      (i32.store offset=0 (global.get $reg_base) (i32.const 0x8876086c)) (return)))
++    (if (local.get $arg1) (then
++      (call $gs32 (local.get $arg1) (call $gl32 (i32.add (local.get $state) (i32.const 25616))))))
++    (i32.store offset=0 (global.get $reg_base) (i32.const 0))
+     (i32.store offset=16 (global.get $reg_base) (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12))))
+ 
+   ;; IDirect3DDevice9_SetScissorRect — 2 args (incl. this)
+diff --git a/src/13-exports.wat b/src/13-exports.wat
+index 56e947081..6763a2e8c 100644
+--- a/src/13-exports.wat
++++ b/src/13-exports.wat
+@@ -2593,6 +2593,27 @@
+     (global.get $loop_xlat_stosb_runs))
+   (func (export "get_loop_xlat_stosb_bytes") (result i64)
+     (global.get $loop_xlat_stosb_bytes))
++  ;; ---- menus-vs-battle frame-rate diagnosis (GitHub issue #3) -----------
++  ;;
++  ;; The report is "Character Select runs at ~20 FPS, battle runs at 60, and
++  ;; the FIRST menu visit is always slow then recovers". Three mechanisms fit
++  ;; that and they need different fixes, so the counters below are what tells
++  ;; them apart from a user's own machine without a profiler:
++  ;;
++  ;;   parks/s   > 0 while a menu runs: the guest is spinning on the clock or
++  ;;             on an empty queue and each spin costs a whole scheduler turn.
++  ;;             That is the 20 FPS -- three of every four frames are spent
++  ;;             waiting for a millisecond that has not started yet.
++  ;;   fills/s   > 0 while a menu runs: the frame is blocked on a lazy chunk
++  ;;             it did not need at launch (first-visit-only slowness).
++  ;;   neither, but PRESENT is still low: it is not this at all, and the
++  ;;             per-step bars + hot blocks are the place to look.
++  (func (export "get_lazy_fill_count") (result i32)
++    (global.get $lazy_fill_count))
++  ;; Published by the host through fs_fill_count_set below; kept on the guest
++  ;; side so the counters travel in one readExports round trip with the rest.
++  (func (export "set_lazy_fill_count") (param $n i32)
++    (global.set $lazy_fill_count (local.get $n)))
+   ;; Compatibility switch: control both families together. Prefer the family
+   ;; switches for an A/B because COPY_RUN remains disabled by default.
+   (func (export "set_loop_emit") (param $flag i32)
+diff --git a/test/test-app-files-policy.js b/test/test-app-files-policy.js
+index 565d31cb6..f11924aa6 100644
+--- a/test/test-app-files-policy.js
++++ b/test/test-app-files-policy.js
+@@ -81,9 +81,113 @@ for (const f of out) {
+   assert(['required', 'lazy', 'background'].includes(f.loadMode));
+ }
+ 
++// ---- preloadAssets: "all the textures must be in before the player plays" --
++//
++// MBAACC's sprite (0002.p, ~900MB) and stage (0003.p, ~140MB) archives are two
++// orders of magnitude over APP_EAGER_BYTES, so the policy above streams them
++// and every miss inside a battle is a Loading window -- and, when a fill fails,
++// a read the game caches as NULL forever. `preloadAssets` names the files that
++// must be IN before the first frame. The two shapes are distinct on purpose:
++// a whole archive is `required` (launch progress, launch failure), a measured
++// subset is `lazy` + `preloadRanges` (those bytes at launch, the rest still
++// streaming).
++const archives = (size) => [
++  { url: 'binaries/mbaa/0002.p', vfsPath: 'c:\\0002.p', size },
++  { url: 'binaries/mbaa/0003.p', vfsPath: 'c:\\0003.p', size },
++  { url: 'binaries/mbaa/0005.p', vfsPath: 'c:\\0005.p', size },
++];
++const BIG = 900 * MB;
++{
++  // Nothing declared: the current behaviour, and the control arm.
++  const base = normalizeLazyFiles({}, archives(BIG));
++  assert.strictEqual(base.summary.policy, 'lazy');
++  assert(base.files.every(f => f.httpRange === true && f.loadMode === undefined),
++    'without preloadAssets every archive streams');
++
++  // A required archive by guest path, by URL and by leaf all work: the author
++  // names the file, not the VFS's flattened spelling.
++  for (const name of ['0002.p', 'c:\\0002.p', 'binaries/mbaa/0002.p']) {
++    const preloaded = normalizeLazyFiles({ preloadAssets: [name] }, archives(BIG));
++    assert.strictEqual(preloaded.files[0].loadMode, 'required', `${name} -> 0002.p required`);
++    assert.strictEqual(preloaded.files[0].size, BIG, 'the size rides along for a HEAD-less mount');
++    assert.strictEqual(preloaded.files[1].loadMode, undefined, `${name} does not take 0003.p`);
++    assert.strictEqual(preloaded.files[2].httpRange, true, `${name} leaves 0005.p streaming`);
++  }
++
++  // A measured range list pins those bytes and nothing else, and the entry is
++  // still a lazy mount so the rest of the archive streams.
++  const ranges = { schemaVersion: 1, size: BIG, ranges: [[0, 4096], [8192, 12288]] };
++  const measured = normalizeLazyFiles(
++    { preloadAssets: ['0002.p'], preloadRanges: { '0002.p': ranges } }, archives(BIG));
++  assert.strictEqual(measured.files[0].loadMode, 'lazy');
++  assert.deepStrictEqual(measured.files[0].preloadRanges.ranges, ranges.ranges);
++  assert.strictEqual(measured.files[0].preloadRanges.size, BIG);
++  assert.strictEqual(measured.files[0].httpRange, undefined, 'a ranged preload is not a whole-file mount');
++
++  // Whole-file preloads are summed and warned about above the budget: a
++  // required 900 MB archive is a launch the user cannot start, and the shape
++  // that causes it (preloadAssets without measured ranges) is exactly what a
++  // registry entry gets before anyone has run the census.
++  {
++    const warnings = [];
++    const realWarn = console.warn;
++    console.warn = (msg) => warnings.push(String(msg));
++    let big;
++    try {
++      big = normalizeLazyFiles({ id: 'mbaa', preloadAssets: ['0002.p', '0003.p'] }, archives(BIG));
++    } finally { console.warn = realWarn; }
++    assert.strictEqual(big.summary.preloadWholeBytes, BIG * 2, 'the launch cost is reported');
++    assert.ok(warnings.some(w => /1040MB|\d+MB/.test(w) && /preloadRanges/.test(w)),
++      'and the warning names the sizes and the tool that fixes it');
++    // Below the budget there is nothing to say.
++    const quiet = [];
++    console.warn = (msg) => quiet.push(String(msg));
++    try {
++      normalizeLazyFiles({ preloadAssets: ['0002.p'] }, [
++        { url: 'binaries/mbaa/0002.p', size: 8 * 1024 * 1024, vfsPaths: ['c:\\0002.p'] },
++        { url: 'binaries/mbaa/0005.p', size: 512 * 1024 * 1024, vfsPaths: ['c:\\0005.p'] },
++      ], { sizeOf: f => (typeof f === 'object' ? f.size : null) });
++    } finally { console.warn = realWarn; }
++    assert.strictEqual(quiet.length, 0, 'a small whole-file preload is silent');
++  }
++
++  // A range list measured on a DIFFERENT file is refused, not pinned: the
++  // bytes would be wrong, and a wrong pin is worse than no pin.
++  const stale = normalizeLazyFiles(
++    { preloadAssets: ['0002.p'], preloadRanges: { '0002.p': { schemaVersion: 1, size: 1, ranges: [[0, 1]] } } },
++    archives(BIG));
++  assert.strictEqual(stale.files[0].loadMode, 'required',
++    'a size-mismatched range list falls back to the honest whole-file preload');
++
++  // A bare pairs array is accepted, and a function can decide per file.
++  const pairs = normalizeLazyFiles(
++    { preloadAssets: ['0002.p'], preloadRanges: { '0002.p': [[0, 16]] } }, archives(BIG));
++  assert.deepStrictEqual(pairs.files[0].preloadRanges.ranges, [[0, 16]]);
++  const byFn = normalizeLazyFiles(
++    { preloadAssets: ['0002.p', '0003.p'],
++      preloadRanges: (file) => (/0003/.test(file.url || file) ? [[0, 32]] : null) }, archives(BIG));
++  assert.strictEqual(byFn.files[0].loadMode, 'required', 'null from the function means whole file');
++  assert.deepStrictEqual(byFn.files[1].preloadRanges.ranges, [[0, 32]]);
++
++  // A directory entry preloads the tree it names.
++  const tree = normalizeLazyFiles({ preloadAssets: ['binaries/mbaa/'] }, archives(BIG));
++  assert(tree.files.every(f => f.loadMode === 'required'), 'a trailing separator takes the whole tree');
++
++  // A preload never overrides a file that already declared how it loads (the
++  // author's explicit loadMode wins), and an unrecognised name changes nothing.
++  const declared = [{ url: 'binaries/mbaa/0002.p', size: BIG, loadMode: 'background' }];
++  assert.strictEqual(normalizeLazyFiles({ preloadAssets: ['0002.p'] }, declared).files[0].loadMode,
++    'background', 'an explicit loadMode is not overridden');
++  assert.strictEqual(normalizeLazyFiles({ preloadAssets: ['nope.p'] }, archives(BIG)).files[0].httpRange,
++    true, 'an unmatched preload entry leaves the file streaming');
++}
++
+ // Both hosts are wired to it.
+ const read = file => fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
+-assert(/appFiles\.normalizeLazyFiles\(app, app\.files/.test(read('lib/browser-shell.js')), 'browser-shell applies the policy');
++// Wired, not spelled: the call may pass a per-launch override object (the
++// ?lazy-files path does), and pinning the exact argument list made a policy
++// test fail for a change that did not touch the policy.
++assert(/appFiles\.normalizeLazyFiles\(\w+, app\.files/.test(read('lib/browser-shell.js')), 'browser-shell applies the policy');
+ assert(/require\('\.\.\/lib\/app-files'\)\.normalizeLazyFiles/.test(read('test/run.js')), 'run.js applies the policy');
+ assert(/"lib\/app-files\.js"/.test(read('index.html')), 'index.html loads lib/app-files.js');
+ 
+diff --git a/test/test-app-files-switches.js b/test/test-app-files-switches.js
+new file mode 100644
+index 000000000..ecaffeeab
+--- /dev/null
++++ b/test/test-app-files-switches.js
+@@ -0,0 +1,79 @@
++#!/usr/bin/env node
++'use strict';
++
++// The two launch-time policy switches, and the promise they make.
++//
++// `?eager-files` came first: it predates the lazy policy, and it is the
++// control arm for measuring that policy ("load everything, as before").
++// `?lazy-files` is the mirror image, added because `preloadAssets` can now
++// make a launch wait on a gigabyte of archives and someone on a slow link
++// needs a way out that is not "edit the registry". They are not symmetric, and
++// that asymmetry is the thing worth pinning:
++//
++//   ?eager-files  -> every file is downloaded before the first frame.
++//   ?lazy-files   -> the preload declarations are dropped; everything else
++//                    about the policy (eager extensions, persistFiles,
++//                    small-app shortcut) still applies.
++//
++// This drives the real policy function rather than the browser, so it is a
++// test of the contract those switches depend on.
++
++const assert = require('assert');
++const path = require('path');
++
++const { normalizeLazyFiles } = require('../lib/app-files');
++
++const MB = 1024 * 1024;
++const files = [
++  { url: 'binaries/mbaa/MBAA.exe', size: 4 * MB, vfsPaths: ['c:\\mbaa\\mbaa.exe'] },
++  { url: 'binaries/mbaa/0002.p', size: 900 * MB, vfsPaths: ['c:\\0002.p'] },
++  { url: 'binaries/mbaa/0003.p', size: 140 * MB, vfsPaths: ['c:\\0003.p'] },
++];
++const sizeOf = file => (typeof file === 'object' ? file.size : null);
++const app = { id: 'mbaa', preloadAssets: ['0002.p', '0003.p'] };
++
++// ---- the default: the declared archives are required at launch ------------
++{
++  const warned = [];
++  const realWarn = console.warn;
++  console.warn = m => warned.push(String(m));
++  let policy;
++  try { policy = normalizeLazyFiles(app, files, { sizeOf }); } finally { console.warn = realWarn; }
++
++  assert.strictEqual(policy.summary.policy, 'lazy');
++  const byUrl = Object.fromEntries(policy.files.map(f => [f.url, f]));
++  assert.strictEqual(byUrl['binaries/mbaa/0002.p'].loadMode, 'required',
++    'a declared preload is required at launch');
++  assert.strictEqual(byUrl['binaries/mbaa/0002.p'].size, 900 * MB,
++    'and carries its size so the mount needs no HEAD');
++  assert.strictEqual(byUrl['binaries/mbaa/MBAA.exe'].loadMode, undefined,
++    'the executable keeps the pre-policy classification');
++  assert.strictEqual(policy.summary.preloadWholeBytes, 1040 * MB,
++    'the whole launch cost is reported');
++  assert.ok(warned.length >= 1, 'and warned about, because it is a gigabyte');
++}
++
++// ---- ?lazy-files: declarations dropped, policy otherwise untouched --------
++{
++  const optedOut = { ...app, preloadAssets: [], preloadRanges: undefined };
++  const policy = normalizeLazyFiles(optedOut, files, { sizeOf });
++  const byUrl = Object.fromEntries(policy.files.map(f => [f.url, f]));
++
++  assert.strictEqual(byUrl['binaries/mbaa/0002.p'].loadMode, undefined,
++    'no file is forced to load at launch');
++  assert.strictEqual(byUrl['binaries/mbaa/0002.p'].httpRange, true,
++    'the archive streams instead, exactly as it did before preloadAssets');
++  assert.strictEqual(byUrl['binaries/mbaa/0003.p'].httpRange, true, 'and so does the other one');
++  assert.strictEqual(policy.summary.preloadWholeBytes, undefined,
++    'with nothing preloaded there is no launch cost to report');
++}
++
++// ---- the switch is a launch-time decision, and it says so in the URL ------
++const shell = require('fs').readFileSync(
++  path.join(__dirname, '..', 'lib', 'browser-shell.js'), 'utf8');
++assert.ok(/\[\?&\]lazy-files\(\?:\[=&\]\|\$\)/.test(shell),
++  'the switch is matched the same anchored way as ?eager-files');
++assert.ok(/preloadAssets: \[\], preloadRanges: undefined/.test(shell),
++  'and clears exactly the preload declarations, nothing else');
++
++console.log('PASS launch policy switches: ?lazy-files drops preloads, ?eager-files keeps loading everything');
+diff --git a/test/test-d3d9-p8-conversion.js b/test/test-d3d9-p8-conversion.js
+new file mode 100644
+index 000000000..1f1581ece
+--- /dev/null
++++ b/test/test-d3d9-p8-conversion.js
+@@ -0,0 +1,152 @@
++#!/usr/bin/env node
++'use strict';
++
++// D3DFMT_P8 conversion: an indexed texture must sample through its palette.
++//
++// This is the half of the "completely white placeholder texture" report that
++// lives in JS. Before this change every P8 texel was uploaded as
++//   r = g = b = <index>, a = 255
++// i.e. the palette index drawn as a grey ramp, which reads as white wherever
++// a sprite's indices are high. On a fighting game whose sprite sheets are
++// paletted that is the whole character: a white silhouette.
++//
++// The conversion is exercised directly rather than through a GL context:
++// decodeTexturePixels is the one function the draw path calls, it is pure, and
++// the palette arrives as a plain 256-entry D3DCOLOR table (the device state the
++// WAT palette handlers write; see test/test-d3d9-palette-state.js).
++//
++// Also pinned here: the converter's contract for the other indexed/bit-depth
++// formats this engine advertises, because a change that makes P8 right must not
++// quietly move one of them.
++
++const assert = require('assert');
++const { decodeTexturePixels } = require('../lib/d3d9-host');
++
++const D3DFMT_P8 = 41;
++const D3DFMT_A8 = 28;
++const D3DFMT_L8 = 50;
++const D3DFMT_A8L8 = 51;
++const D3DFMT_R5G6B5 = 23;
++const D3DFMT_A1R5G5B5 = 25;
++const D3DFMT_A4R4G4B4 = 26;
++const D3DFMT_X8R8G8B8 = 22;
++const D3DFMT_A8R8G8B8 = 21;
++
++const ARGB = (a, r, g, b) => ((a << 24) | (r << 16) | (g << 8) | b) >>> 0;
++const rgbaAt = (pixels, i) => Array.from(pixels.slice(i * 4, i * 4 + 4));
++
++// A palette shaped like a real sprite sheet: index 0 is the transparent key,
++// the rest are distinct colours, the last 240..255 are a bright ramp (the
++// "white" end the old code smeared across the sprite).
++function sheetPalette() {
++  const palette = new Uint32Array(256);
++  // The key colour is colour-free AND transparent. Note this engine reads an
++  // all-zero entry as "never written" and shows it opaque black (case 2), so a
++  // real key is expressed as alpha 0 with a set colour -- which is also what a
++  // sprite sheet's exporter writes.
++  palette[0] = 0x00000001;                       // key colour: alpha 0, RGB set
++  for (let i = 1; i < 240; i++) palette[i] = ARGB(255, i, (i * 5) & 255, (255 - i) & 255);
++  for (let i = 240; i < 256; i++) palette[i] = ARGB(255, 255, 250 + ((i - 240) % 6), 240);
++  return palette;
++}
++
++// 1. The report's symptom, exactly: a 4x1 strip whose indices happen to be
++//    bright must show its PALETTE colours, not white.
++{
++  const palette = sheetPalette();
++  const src = new Uint8Array([0, 1, 128, 250]);
++  const pixels = decodeTexturePixels(D3DFMT_P8, src, 4, 1, palette);
++  assert.strictEqual(pixels.length, 16);
++  // index 0 -> the key colour, transparent (a sprite's cut-out must survive)
++  // (alpha 0 with a non-zero colour: an unset entry, 0x00000000, is shown
++  //  opaque black instead -- case 2 pins that.)
++  assert.deepStrictEqual(rgbaAt(pixels, 0), [0, 0, 1, 0], 'index 0 is the transparent key');
++  // index 1 -> palette entry 1, byte by byte, not the index
++  assert.deepStrictEqual(rgbaAt(pixels, 1), [1, 5, 254, 255], 'index 1 resolves through the palette');
++  // index 128 -> a mid colour, and crucially NOT (128,128,128,255)
++  assert.deepStrictEqual(rgbaAt(pixels, 2), [128, 128, 127, 255]);
++  assert.notDeepStrictEqual(rgbaAt(pixels, 2), [128, 128, 128, 255],
++    'the upload must not be the index as luminance');
++  // index 250 -> the bright end of the palette (240 + (250-240)%6 green)
++  assert.deepStrictEqual(rgbaAt(pixels, 3), [255, 254, 240, 255]);
++  // Every opaque texel is NOT full white: the old conversion could not say
++  // this, and it is the actual measured difference on a white sprite.
++  const opaque = [0, 1, 2, 3].map(i => rgbaAt(pixels, i)).filter(p => p[3] === 255);
++  assert.ok(opaque.some(p => p[0] !== 255 || p[1] !== 255 || p[2] !== 255),
++    'a paletted strip is not uniformly white');
++}
++
++// 2. Alpha is taken from the palette's top byte, and an all-zero entry is
++//    opaque black rather than invisible: a cleared palette table must not
++//    turn a whole sprite into a no-op.
++{
++  const palette = new Uint32Array(256);          // never written
++  const pixels = decodeTexturePixels(D3DFMT_P8, new Uint8Array([7]), 1, 1, palette);
++  assert.deepStrictEqual(rgbaAt(pixels, 0), [0, 0, 0, 255],
++    'an unwritten palette entry is opaque black, not transparent');
++  palette[9] = ARGB(0, 200, 100, 50);            // explicit alpha 0, colour set
++  assert.deepStrictEqual(
++    rgbaAt(decodeTexturePixels(D3DFMT_P8, new Uint8Array([9]), 1, 1, palette), 0),
++    [200, 100, 50, 0], 'a set colour with alpha 0 stays transparent');
++  palette[10] = ARGB(128, 10, 20, 30);
++  assert.deepStrictEqual(
++    rgbaAt(decodeTexturePixels(D3DFMT_P8, new Uint8Array([10]), 1, 1, palette), 0),
++    [10, 20, 30, 128], 'partial alpha passes through untouched');
++}
++
++// 3. The byte-length gate stays a gate: a short P8 source is refused, not
++//    silently over-read (that over-read would read palette bytes as indices).
++{
++  assert.throws(() => decodeTexturePixels(D3DFMT_P8, new Uint8Array(3), 4, 1, sheetPalette()),
++    /invalid texture byte length/);
++}
++
++// 4. Format contract for the formats whose conversion shares this function,
++//    pinned so a P8 fix cannot move them silently.
++{
++  // A8: colour is white, alpha is the source byte.
++  assert.deepStrictEqual(rgbaAt(decodeTexturePixels(D3DFMT_A8, new Uint8Array([0, 128, 255]), 3, 1), 1),
++    [255, 255, 255, 128]);
++  // L8: luminance on all three channels, opaque.
++  assert.deepStrictEqual(rgbaAt(decodeTexturePixels(D3DFMT_L8, new Uint8Array([77]), 1, 1), 0),
++    [77, 77, 77, 255]);
++  // A8L8: luminance in the LOW byte, alpha in the high one.
++  assert.deepStrictEqual(rgbaAt(decodeTexturePixels(D3DFMT_A8L8, new Uint8Array([77, 200]), 1, 1), 0),
++    [77, 77, 77, 200]);
++  // R5G6B5: channels replicated into the high bits, so all-ones reaches 255.
++  assert.deepStrictEqual(rgbaAt(decodeTexturePixels(D3DFMT_R5G6B5, new Uint8Array([0xff, 0xff]), 1, 1), 0),
++    [255, 255, 255, 255]);
++  // A1R5G5B5: the top bit is alpha.
++  assert.deepStrictEqual(rgbaAt(decodeTexturePixels(D3DFMT_A1R5G5B5, new Uint8Array([0x00, 0x00]), 1, 1), 0),
++    [0, 0, 0, 0]);
++  // A4R4G4B4: nibble times 17 spans 0..255 exactly. Little-endian word, so
++  // the LOW nibble is blue: 0xF00F is alpha F, red 0, green 0, blue F.
++  assert.deepStrictEqual(rgbaAt(decodeTexturePixels(D3DFMT_A4R4G4B4, new Uint8Array([0x0f, 0xf0]), 1, 1), 0),
++    [0, 0, 255, 255], 'A4R4G4B4 low nibble is blue, top nibble is alpha');
++  // 0x0FFF: alpha 0 (top nibble of the high byte), red F, green F, blue F.
++  assert.deepStrictEqual(rgbaAt(decodeTexturePixels(D3DFMT_A4R4G4B4, new Uint8Array([0xff, 0x0f]), 1, 1), 0),
++    [255, 255, 255, 0], 'A4R4G4B4 keeps its alpha nibble');
++  // xRGB: stored blue-first (D3D), no alpha channel to read.
++  assert.deepStrictEqual(rgbaAt(decodeTexturePixels(D3DFMT_X8R8G8B8, new Uint8Array([30, 20, 10, 0xEE]), 1, 1), 0),
++    [10, 20, 30, 255], 'X8R8G8B8 is opaque regardless of the fourth byte');
++  assert.deepStrictEqual(rgbaAt(decodeTexturePixels(D3DFMT_A8R8G8B8, new Uint8Array([30, 20, 10, 0xEE]), 1, 1), 0),
++    [10, 20, 30, 0xEE], 'A8R8G8B8 keeps its alpha');
++}
++
++// 5. A 3x2 sheet is row-major with no padding surprises: sprite sheets are
++//    almost never power-of-two-square in the sheets MBAACC uses.
++{
++  const palette = sheetPalette();
++  const src = new Uint8Array([0, 1, 2, 3, 4, 5]);
++  const pixels = decodeTexturePixels(D3DFMT_P8, src, 3, 2, palette);
++  const resolve = (c) => {
++    const a = (c >>> 24) & 255;
++    return [(c >>> 16) & 255, (c >>> 8) & 255, c & 255, a === 0 && c === 0 ? 255 : a];
++  };
++  for (let i = 0; i < 6; i++) {
++    assert.deepStrictEqual(rgbaAt(pixels, i), resolve(palette[i]),
++      `texel ${i} lands at its row-major slot`);
++  }
++}
++
++console.log('PASS D3DFMT_P8 resolves through its palette; other format conversions unchanged');
+diff --git a/test/test-d3d9-palette-state.js b/test/test-d3d9-palette-state.js
+new file mode 100644
+index 000000000..640ab99d5
+--- /dev/null
++++ b/test/test-d3d9-palette-state.js
+@@ -0,0 +1,154 @@
++#!/usr/bin/env node
++'use strict';
++
++// D3DFMT_P8 is an INDEXED format, and an indexed texture is only meaningful
++// through a palette. Two things had to be true for the "completely white
++// placeholder texture" report, and both were false:
++//
++//   1. the device stored no palette at all -- SetPaletteEntries returned
++//      D3D_OK while storing nothing, so a game could neither write nor read
++//      back what it had written; and
++//   2. lib/d3d9-host.js uploaded the index byte as luminance
++//      (r = g = b = index, a = 255), so a paletted sprite drew as a grey ramp
++//      of its own indices and went white wherever the indices are high.
++//
++// This pins the WAT half: the storage the host reads, its addressing, the
++// clamp SetCurrentTexturePalette is documented to apply, the copy semantics of
++// both directions, and the refused-device path. The conversion half is pinned
++// by test-d3d9-p8-conversion.js, which draws and reads the pixels back.
++//
++// The LAYOUT is a contract with lib/d3d9-host.js, which resolves P8 by reading
++// `state+25616` (current palette number) and `state+25620 + 1024*number`
++// (256 D3DCOLORs, 0xAARRGGBB) as guest addresses. If either side moves, this
++// test is the thing that says so.
++
++const assert = require('assert');
++const { bootRenderHarness } = require('./render-helper');
++
++const D3D_OK = 0;
++const D3DERR_INVALIDCALL = 0x8876086C;
++const PALETTE_SLOT = 25616;   // current palette number
++const PALETTE_BASE = 25620;   // 16 x 1024 bytes
++const ENTRY_BYTES = 1024;
++
++const ARGB = (a, r, g, b) => ((a << 24) | (r << 16) | (g << 8) | b) >>> 0;
++
++(async () => {
++  const { exports: e } = await bootRenderHarness({ fonts: 'none', extraWat: `
++    (func (export "new_device") (result i32)
++      (local $device i32)
++      (local.set $device (call $dx_create_com_obj (i32.const 20) (global.get $DX_VTBL_D3DDEV9)))
++      (store.field DxObject misc1 (call $dx_from_this (local.get $device)) (call $d3d9_program_alloc))
++      (local.get $device))
++    ;; The stdcall convention every handler in this tree uses: read the args
++    ;; from the guest stack at ESP+4, +8, ... so the handler can pop its own
++    ;; frame. ESP is staged with set_esp from the JS side (see below).
++    (func (export "set_palette") (result i32)
++      (call $handle_IDirect3DDevice9_SetPaletteEntries
++        (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
++        (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
++        (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
++        (i32.const 0) (i32.const 0) (i32.const 0))
++      (i32.load offset=0 (global.get $reg_base)))
++    (func (export "get_palette") (result i32)
++      (call $handle_IDirect3DDevice9_GetPaletteEntries
++        (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
++        (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
++        (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 12)))
++        (i32.const 0) (i32.const 0) (i32.const 0))
++      (i32.load offset=0 (global.get $reg_base)))
++    (func (export "set_current") (result i32)
++      (call $handle_IDirect3DDevice9_SetCurrentTexturePalette
++        (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
++        (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
++        (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
++      (i32.load offset=0 (global.get $reg_base)))
++    (func (export "get_current") (result i32)
++      (call $handle_IDirect3DDevice9_GetCurrentTexturePalette
++        (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 4)))
++        (call $gl32 (i32.add (i32.load offset=16 (global.get $reg_base)) (i32.const 8)))
++        (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
++      (i32.load offset=0 (global.get $reg_base)))
++    (func (export "state") (param $d i32) (result i32)
++      (call $d3d9_program_state (local.get $d)))
++  ` });
++
++  e.init_dx_com_thunks();
++  const d = e.new_device();
++  assert.ok(d, 'device created');
++  const state = e.state(d) >>> 0;
++  assert.ok(state, 'device program state is guest-addressable');
++
++  const out = 0x00410000;             // scratch, well clear of engine memory
++  // Handlers read their arguments from the guest stack at ESP+4. Stage a
++  // stdcall frame the way the dispatcher does, then call the thunk body.
++  const STACK = 0x0040F000;
++  const call = (fn, ...args) => {
++    e.set_esp(STACK);
++    for (let i = 0; i < args.length; i++) e.guest_write32(STACK + 4 + i * 4, args[i] | 0);
++    return e[fn]() >>> 0;
++  };
++  const palette = new Uint32Array(256);
++  for (let i = 0; i < 256; i++) palette[i] = ARGB(i === 0 ? 0 : 255, i, (i * 3) & 255, 255 - i);
++
++  // 1. Write palette 3 and read it back through the sibling getter.
++  for (let i = 0; i < 256; i++) e.guest_write32(out + i * 4, palette[i] | 0);
++  assert.strictEqual(call('set_palette', d, 3, out), D3D_OK, 'SetPaletteEntries(3) returns D3D_OK');
++  // ...and through the layout the host reads, which is the part that matters.
++  const base = state + PALETTE_BASE + 3 * ENTRY_BYTES;
++  for (const index of [0, 1, 2, 77, 254, 255]) {
++    assert.strictEqual(e.guest_read32(base + index * 4) >>> 0,
++      palette[index], `palette 3 entry ${index} stored`);
++  }
++  // The neighbours are untouched: 1024 bytes exactly, no spill over.
++  assert.strictEqual(e.guest_read32(state + PALETTE_BASE + 2 * ENTRY_BYTES + 1020) >>> 0, 0,
++    'palette 2 stays zero after writing palette 3');
++  for (let i = 0; i < 256; i++) e.guest_write32(out + i * 4, 0xDEADBEEF);
++  assert.strictEqual(call('get_palette', d, 3, out), D3D_OK, 'GetPaletteEntries(3) returns D3D_OK');
++  for (const index of [0, 128, 255]) {
++    assert.strictEqual(e.guest_read32(out + index * 4) >>> 0, palette[index],
++      `GetPaletteEntries round-trips entry ${index}`);
++  }
++
++  // 2. Sixteen independent palettes; the sixteenth is the last addressable one.
++  for (let n = 0; n < 16; n++) {
++    for (let i = 0; i < 256; i++) e.guest_write32(out + i * 4, ARGB(255, n, n, n) | 0);
++    assert.strictEqual(call('set_palette', d, n, out), D3D_OK, `palette ${n} accepted`);
++    assert.strictEqual(e.guest_read32(state + PALETTE_BASE + n * ENTRY_BYTES) >>> 0,
++      ARGB(255, n, n, n), `palette ${n} stored at its own slot`);
++  }
++  assert.strictEqual(call('set_palette', d, 16, out), D3DERR_INVALIDCALL,
++    'a seventeenth palette is refused, not silently wrapped');
++
++  // 3. The current-palette selector: stored, read back, and D3D9's documented
++  //    clamp for an out-of-range number (D3D9 says the system palette; we
++  //    clamp, which keeps the last defined palette rather than an undefined
++  //    pointer -- the audit comment in lib/d3d9-host.js says why).
++  assert.strictEqual(call('set_current', d, 5), D3D_OK);
++  assert.strictEqual(call('get_current', d, out), D3D_OK);
++  assert.strictEqual(e.guest_read32(out) >>> 0, 5, 'GetCurrentTexturePalette reads what was set');
++  e.guest_write32(out, 0xFFFFFFFF);
++  assert.strictEqual(call('set_current', d, 999), D3D_OK, 'out-of-range selection does not fail');
++  assert.strictEqual(call('get_current', d, out), D3D_OK);
++  assert.strictEqual(e.guest_read32(out) >>> 0, 999, 'the raw number is preserved for the reader');
++
++  // 4. A NULL entry list is success with no change (D3D9's behaviour for a
++  //    null source), not a crash and not a cleared palette.
++  const before = e.guest_read32(state + PALETTE_BASE + 7 * ENTRY_BYTES) >>> 0;
++  assert.strictEqual(call('set_palette', d, 7, 0), D3D_OK, 'NULL entries is success');
++  assert.strictEqual(e.guest_read32(state + PALETTE_BASE + 7 * ENTRY_BYTES) >>> 0, before,
++    'NULL entries leaves the palette alone');
++
++  // 5. A device that is not a D3D9 device is refused, not dereferenced.
++  assert.strictEqual(call('set_palette', 0, 0, out), D3DERR_INVALIDCALL);
++  assert.strictEqual(call('get_palette', 0, 0, out), D3DERR_INVALIDCALL);
++  assert.strictEqual(call('get_current', 0, out), D3DERR_INVALIDCALL);
++
++  // 6. The allocation is still the ONE the build gates size: 42000 bytes from
++  //    25616, i.e. exactly 16 palettes after the selector. A short allocation
++  //    would let palette 15 write past the heap block.
++  assert.strictEqual(PALETTE_BASE + 16 * ENTRY_BYTES, 42004,
++    'the palette block ends 4 bytes before d3d9_program_alloc stops allocating');
++
++  console.log('PASS D3D9 texture palettes: 16 slots, copy both ways, selector clamp, NULL entries, bad device');
++})().catch(err => { console.error(err); process.exit(1); });
+diff --git a/test/test-d3d9-texture-argb4444.js b/test/test-d3d9-texture-argb4444.js
+index 1e7df1987..75ba144bf 100644
+--- a/test/test-d3d9-texture-argb4444.js
++++ b/test/test-d3d9-texture-argb4444.js
+@@ -26,7 +26,11 @@ const { bootRenderHarness } = require('./render-helper');
+ const ARGB4444 = 26;      // D3DFMT_A4R4G4B4
+ const A8R8G8B8 = 21;
+ const FMT_A8 = 28;        // D3DFMT_A8
+-const UNSUPPORTED = 41;   // D3DFMT_P8 -- paletted format not stored directly
++// P8 used to be the unsupported example here; it is now stored AND sampled
++// through the device palette (the white-sprite fix), so the stand-in is A4L4,
++// which is still not storable. P8's own pitch/palette contract lives in
++// test-d3d9-p8-conversion.js and test-d3d9-palette-state.js.
++const UNSUPPORTED = 52;   // D3DFMT_A4L4 -- still not stored
+ const D3DERR_NOTAVAILABLE = 0x8876086A;
+ const D3DERR_INVALIDCALL = 0x8876086C;
+ 
+diff --git a/test/test-d3d9-textures.js b/test/test-d3d9-textures.js
+index 189b64129..f083bd29c 100644
+--- a/test/test-d3d9-textures.js
++++ b/test/test-d3d9-textures.js
+@@ -167,11 +167,19 @@ const {REGIONS}=require('../lib/region-map.generated.js');
+   }
+   // A format we cannot store must be refused, and CheckDeviceFormat has to say
+   // so first: a yes there followed by a refusal here is what left the slot NULL.
+-  assert.strictEqual(e.texture(d,8,4,1,out,41)>>>0,0x8876086c,'P8 is not stored');
+-  for(const format of [20,21,22,23,50,51,62,81,Texture.DXT1,Texture.DXT3,Texture.DXT5])
++  //
++  // D3DFMT_P8 (41) used to be on this list. It is now genuinely stored and
++  // sampled through the device palette (the "white placeholder texture"
++  // report), so it MOVED to the accepted side -- refusing it here while
++  // CheckDeviceFormat says yes is exactly the mismatch this test exists to
++  // catch, and it would have been the new bug. Its conversion and its 1-byte
++  // pitch are pinned by test-d3d9-p8-conversion.js and
++  // test-d3d9-palette-state.js.
++  for(const format of [20,21,22,23,41,50,51,62,81,Texture.DXT1,Texture.DXT3,Texture.DXT5])
+     assert.strictEqual(e.check_format(0,3,format),0,`CheckDeviceFormat accepts ${format}`);
+-  for(const format of [41,52,77]) // P8, A4L4, D3DFMT_D24X8
++  for(const format of [52,77]) // A4L4, D3DFMT_D24X8 -- still not storable
+     assert.strictEqual(e.check_format(0,3,format)>>>0,0x8876086a,`CheckDeviceFormat refuses ${format}`);
++  assert.strictEqual(e.texture(d,8,4,1,out,52)>>>0,0x8876086c,'A4L4 is not stored');
+   assert.strictEqual(e.get_esp(),0x00300020,'CheckDeviceFormat pops seven args');
+   // A volume texture with a zero extent is refused the way real D3D9 refuses
+   // it, not trapped: B&W2's land loader asks d3dx9 for a 0x0x0 one and reads
+diff --git a/test/test-mbaa-texture-census.js b/test/test-mbaa-texture-census.js
+new file mode 100644
+index 000000000..96a569636
+--- /dev/null
++++ b/test/test-mbaa-texture-census.js
+@@ -0,0 +1,164 @@
++#!/usr/bin/env node
++'use strict';
++
++// tools/mbaa-texture-census.js: the range list it emits is the one thing a
++// launch will PIN, so the tool's two failure modes matter more than its happy
++// path:
++//
++//   * classify a non-texture member as a texture  -> launch downloads bytes it
++//     did not need (the whole point of the range list is that it is small);
++//   * misparse the container and emit ranges     -> launch pins the WRONG
++//     bytes, and a texture that is resident but wrong is worse than one that
++//     streams. So a parse failure must exit non-zero and write nothing.
++//
++// This drives the real CLI against synthetic archives built in the temp dir,
++// including an archive whose name table needs the second advance rule. Both
++// layouts are exercised because the .p container is the one shape this tree
++// does not otherwise parse: the tool decides the rule empirically (the cursor
++// must land exactly on the first member's data) rather than trusting a
++// convention.
++
++const assert = require('assert');
++const fs = require('fs');
++const os = require('os');
++const path = require('path');
++const { execFileSync } = require('child_process');
++const { preloadRangesFor } = require('../lib/byte-provider');
++
++const TOOL = path.join(__dirname, '..', 'tools', 'mbaa-texture-census.js');
++const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mbaa-census-'));
++
++// A synthesised member: an 8-byte-image header (w, h, format, payload length)
++// followed by `payload` bytes of indices. format 0 = 8bpp, so payload = w*h.
++function textureMember(w, h, fill) {
++  const head = Buffer.alloc(16);
++  head.writeUInt32LE(w, 0); head.writeUInt32LE(h, 4);
++  head.writeUInt32LE(0, 8); head.writeUInt32LE(w * h, 12);
++  return Buffer.concat([head, Buffer.alloc(w * h, fill)]);
++}
++function otherMember(bytes) { return Buffer.alloc(bytes, 0x22); }
++
++// `shape` A: names NUL-terminated, stored length EXCLUDES the terminator.
++// `shape` B: '\0name', stored length EXCLUDES the leading NUL (so the cursor
++// step is length + 1 as well, but the 1 is the prefix -- the tool's rule is
++// empirical, which is the point of testing both).
++function writeArchive(file, members, shape) {
++  const n = members.length;
++  const names = shape === 'A'
++    ? Buffer.concat(members.map(m => Buffer.from(m.name + '\0', 'latin1')))
++    : Buffer.concat(members.map(m => Buffer.from('\0' + m.name, 'latin1')));
++  const namesAt = 16, tableLength = n * 8;
++  const dataAt = namesAt + tableLength + names.length;
++  let at = dataAt;
++  const entries = [];
++  for (const m of members) {
++    entries.push([at, m.name.length + (shape === 'A' ? 1 : 1)]);
++    at += m.data.length;
++  }
++  // ...but the STEP that lands on dataAt is a property of the shape, and for
++  // B it is the same length+1 because the prefix is not counted.
++  const header = Buffer.alloc(16);
++  header.writeUInt32LE(n, 4); header.writeUInt32LE(namesAt, 8); header.writeUInt32LE(dataAt, 12);
++  const table = Buffer.alloc(tableLength);
++  entries.forEach(([offset, length], i) => {
++    table.writeUInt32LE(offset, i * 8);
++    table.writeUInt32LE(length, i * 8 + 4);
++  });
++  fs.writeFileSync(file, Buffer.concat([header, table, names, ...members.map(m => m.data)]));
++  return { dataAt, names };
++}
++
++function run(file, ...extra) {
++  try {
++    const stdout = execFileSync(process.execPath, [TOOL, file, ...extra], { encoding: 'utf8' });
++    return { code: 0, stdout };
++  } catch (error) {
++    return { code: error.status || 1, stdout: String(error.stdout || ''), stderr: String(error.stderr || '') };
++  }
++}
++
++const members = [
++  { name: 'spr_a.bin', data: textureMember(8, 8, 0x11) },
++  { name: 'bgm.dat', data: otherMember(1000) },
++  { name: 'spr_b.bin', data: textureMember(16, 16, 0x33) },
++];
++
++for (const shape of ['A', 'B']) {
++  const archive = path.join(dir, `shape-${shape}.p`);
++  const out = path.join(dir, `shape-${shape}.json`);
++  const { dataAt } = writeArchive(archive, members, shape);
++  const result = run(archive, `--out=${out}`);
++  assert.strictEqual(result.code, 0, `shape ${shape} parses: ${result.stderr}`);
++  const list = JSON.parse(fs.readFileSync(out, 'utf8'));
++
++  // The list is the preloadRangesFor() contract, so prove it is readable by the
++  // consumer rather than just well-shaped.
++  const size = fs.statSync(archive).size;
++  assert.strictEqual(list.schemaVersion, 1);
++  assert.strictEqual(list.size, size, 'the measured size is the file size');
++  const ranges = preloadRangesFor(list, size);
++  assert.ok(ranges.length >= 1, 'preloadRangesFor accepts the emitted list');
++
++  // Two texture members, the 1000-byte BGM member NOT pinned, and every pinned
++  // byte is inside the archive.
++  const pinned = ranges.reduce((sum, r) => sum + (r[1] - r[0]), 0);
++  assert.strictEqual(pinned, 80 + 272, `shape ${shape}: only the two texture members are pinned`);
++  assert.ok(pinned < size, 'the range list is smaller than the archive');
++  for (const [start, end] of ranges) {
++    assert.ok(start >= dataAt && end <= size, 'a pinned range stays inside the data area');
++  }
++  // The other member's bytes are not covered by any range.
++  const other = dataAt + 80;
++  assert.ok(!ranges.some(([start, end]) => start <= other && end > other),
++    'the non-texture member is left streaming');
++}
++
++// A truncated/corrupt table must FAIL, and must not leave a range list behind:
++// a launch that pins garbage is worse than a launch that streams.
++for (const [label, corrupt] of [
++  ['count beyond EOF', buf => { buf.writeUInt32LE(9999, 4); return buf; }],
++  ['name table outside the file', buf => { buf.writeUInt32LE(buf.length + 0x1000, 8); return buf; }],
++  ['data offset before the name table', buf => { buf.writeUInt32LE(4, 12); return buf; }],
++  ['truncated member table', buf => buf.subarray(0, 20)],
++]) {
++  const archive = path.join(dir, `bad-${label.replace(/\W+/g, '-')}.p`);
++  const out = path.join(dir, `bad-${label.replace(/\W+/g, '-')}.json`);
++  const base = path.join(dir, 'shape-A.p');
++  fs.writeFileSync(archive, corrupt(fs.readFileSync(base)));
++  const result = run(archive, `--out=${out}`);
++  assert.notStrictEqual(result.code, 0, `${label}: the tool must exit non-zero`);
++  assert.ok(!fs.existsSync(out), `${label}: no range list is written`);
++  assert.ok(/not a \.p archive|no name-table advance rule/.test(result.stderr),
++    `${label}: the message names the problem`);
++}
++
++// The pin bound is a bound: a list that would pin more than --max-mb fails
++// loudly instead of quietly turning a "few tens of MB" preload into the whole
++// archive (which is what preloadAssets is for).
++{
++  const archive = path.join(dir, 'too-big.p');
++  writeArchive(archive, [
++    { name: 'a.bin', data: textureMember(64, 64, 1) },
++    { name: 'b.bin', data: textureMember(64, 64, 2) },
++  ], 'A');
++  const result = run(archive, '--max-mb=0', `--out=${path.join(dir, 'too-big.json')}`);
++  assert.notStrictEqual(result.code, 0, 'over the pin bound is a failure');
++  assert.ok(!fs.existsSync(path.join(dir, 'too-big.json')), 'and writes nothing');
++}
++
++// --list and --json are diagnostics and must not need --out.
++{
++  const list = run(path.join(dir, 'shape-A.p'), '--json');
++  assert.strictEqual(list.code, 0, list.stderr);
++  const parsed = JSON.parse(list.stdout);
++  assert.strictEqual(parsed.textureMembers, 2);
++  assert.strictEqual(parsed.otherMembers, 1);
++  assert.ok(parsed.list.some(m => m.kind === 'texture:raw' && m.name === 'spr_a.bin'));
++  // --list alone is the human form and must mention the classification.
++  const human = run(path.join(dir, 'shape-A.p'), '--list');
++  assert.strictEqual(human.code, 0);
++  assert.ok(/texture:raw/.test(human.stdout) && /bgm\.dat/.test(human.stdout));
++}
++
++fs.rmSync(dir, { recursive: true, force: true });
++console.log('PASS mbaa texture census: both .p name-table shapes, texture-only ranges, corrupt archives refused');
+diff --git a/test/test-perf-hud-waiting.js b/test/test-perf-hud-waiting.js
+new file mode 100644
+index 000000000..2d43eb9b9
+--- /dev/null
++++ b/test/test-perf-hud-waiting.js
+@@ -0,0 +1,106 @@
++#!/usr/bin/env node
++'use strict';
++
++// The waiting lines on the perf HUD (lib/perf-hud.js).
++//
++// GitHub issue #3 reports Character Select / Options at ~20 FPS against 60 in
++// battle, with the first visit to a menu always slow. Two mechanisms fit, and
++// the fix for one does nothing for the other:
++//
++//   * the guest spinning on a clock or an empty queue and paying a scheduler
++//     turn per spin ($clock_spin_parks / $peek_spin_parks), or
++//   * the guest blocked on a lazy chunk that was not resident yet
++//     ($lazy_fill_count), which is first-visit-only by nature.
++//
++// So the HUD has to show both rates, and has to show them as a *rate*: a
++// cumulative count that only grows tells you nothing about the current screen.
++// The arithmetic is the part worth testing (wrap, missing samples, first
++// sample), which is what this does, against the real class.
++
++const assert = require('assert');
++const fs = require('fs');
++const path = require('path');
++const vm = require('vm');
++
++const ROOT = path.join(__dirname, '..');
++
++// lib/perf-hud.js is a browser file: it defines a class and hangs it off a
++// global. Load it in a sandbox with just enough of a window to exist.
++const sandbox = {
++  console,
++  setTimeout: () => 0,
++  clearInterval: () => {},
++  setInterval: () => 0,
++  performance: { now: () => Date.now() },
++  navigator: {},
++  location: { search: '' },
++  document: null,
++  window: null,
++  URLSearchParams,
++  Date,
++  Math,
++  Promise,
++};
++sandbox.globalThis = sandbox;
++sandbox.window = sandbox;
++vm.createContext(sandbox);
++vm.runInContext(fs.readFileSync(path.join(ROOT, 'lib', 'perf-hud.js'), 'utf8'), sandbox,
++  { filename: 'lib/perf-hud.js' });
++// The file exports a singleton (`global.WinePerf`), not the class. Its state
++// is per-instance, but only the rates are exercised here, so the singleton is
++// the right object: it is what host.js actually calls.
++const hud = sandbox.WinePerf;
++assert.ok(hud && typeof hud._guestRate === 'function', 'the HUD singleton is exported');
++
++// --- no samples at all -----------------------------------------------------
++assert.strictEqual(hud._guestRate('get_clock_spin_parks'), 0, 'no sample -> 0, not NaN');
++assert.ok(!Number.isNaN(hud._guestRate('get_lazy_fill_count')), 'still a number');
++
++// --- one sample: a rate needs two ------------------------------------------
++hud._guestCounters = { at: 1000, app: 'mbaa', values: { get_clock_spin_parks: 500 } };
++assert.strictEqual(hud._guestRate('get_clock_spin_parks'), 0, 'a first sample cannot make a rate');
++
++// --- the ordinary case: 300 parks over 2 s ---------------------------------
++hud._guestCounters = {
++  at: 3000, app: 'mbaa', previous: hud._guestCounters,
++  values: { get_clock_spin_parks: 800 },
++};
++assert.strictEqual(hud._guestRate('get_clock_spin_parks'), 150, '300 parks in 2s is 150/s');
++
++// --- the counters are i32: they wrap, and a wrap must not read as negative --
++hud._guestCounters = {
++  at: 4000, app: 'mbaa', previous: { at: 3000, values: { get_clock_spin_parks: 0xfffffffe } },
++  values: { get_clock_spin_parks: 2 },
++};
++assert.strictEqual(hud._guestRate('get_clock_spin_parks'), 4, 'a wrapped counter still measures 4/s');
++
++// --- a counter the export table does not have is simply absent ------------
++hud._guestCounters = {
++  at: 5000, app: 'mbaa', previous: { at: 4000, values: {} },
++  values: {},
++};
++assert.strictEqual(hud._guestRate('get_lazy_fill_count'), 0, 'a missing exporter reads 0');
++
++// --- a degenerate window (same timestamp) must not divide by zero ---------
++hud._guestCounters = {
++  at: 6000, app: 'mbaa', previous: { at: 6000, values: { get_lazy_fill_count: 1 } },
++  values: { get_lazy_fill_count: 5 },
++};
++assert.strictEqual(hud._guestRate('get_lazy_fill_count'), 0, 'a zero-length window reads 0');
++
++// --- the sampler must actually ask for the counters -----------------------
++const source = fs.readFileSync(path.join(ROOT, 'lib', 'perf-hud.js'), 'utf8');
++const namesBlock = source.slice(source.indexOf("const names = ['"), source.indexOf('];', source.indexOf("const names = ['")));
++for (const name of ['get_clock_spin_parks', 'get_peek_spin_parks', 'get_lazy_fill_count']) {
++  assert.ok(namesBlock.includes(`'${name}'`), `the sampler reads ${name}`);
++}
++
++// --- and the guest must publish the fill counter the host maintains -------
++const guestExports = fs.readFileSync(path.join(ROOT, 'src', '13-exports.wat'), 'utf8');
++assert.ok(/\(export "get_lazy_fill_count"\)/.test(guestExports), 'the getter is exported');
++assert.ok(/\(export "set_lazy_fill_count"\)/.test(guestExports), 'the setter is exported');
++const hostSource = fs.readFileSync(path.join(ROOT, 'host.js'), 'utf8');
++assert.ok(/_publishLazyFills\(\)/.test(hostSource), 'the host publishes the counter');
++assert.ok(/set_lazy_fill_count/.test(hostSource), 'through the guest export');
++
++console.log('PASS perf HUD waiting lines: park/s and fill/s are rates, wrap-safe and NaN-free');
+diff --git a/test/test-readfile-park-idempotence.js b/test/test-readfile-park-idempotence.js
+new file mode 100644
+index 000000000..ce61645dc
+--- /dev/null
++++ b/test/test-readfile-park-idempotence.js
+@@ -0,0 +1,133 @@
++#!/usr/bin/env node
++'use strict';
++
++// A parked read is not a completed read.
++//
++// When a provider-backed chunk is not resident, the host returns 997 and the
++// guest re-enters the exact same call after the fill. The guest's own memory is
++// live across that park (the parked stdcall frame is replayed rather than
++// re-created, and a nested run can deliver a callback while it is parked), so
++// anything the host writes on the abandoning attempt is visible and stays
++// visible. The dangerous write is the byte count: a 0 there is not "no bytes"
++// -- it is "this call has not happened yet" -- and a guest that samples it
++// draws a string truncated to whatever the previous, shorter read left behind.
++// That is the reported pre-battle dialogue ("The", then "Th", then "The..."):
++// the text is re-read from the file every frame, the file streams its chunks
++// lazily, and each park published a count the guest could not tell from EOF.
++//
++// The contract asserted below, for BOTH read entry points:
++//   * a park (997) leaves *lpBytesRead exactly as it found it;
++//   * repeated parks (a slow fill) keep leaving it alone;
++//   * a real completion writes the real count -- the fix is "don't lie while
++//     parked", not "never publish".
++
++const assert = require('assert');
++
++const { VirtualFS, createFilesystemImports } = require('../lib/filesystem');
++const RegionMap = require('../lib/region-map.generated');
++
++const GUEST = 'c:\\dialogue.dat';
++const IMAGE_BASE = 0x400000;
++const BUFFER = 0x400000;
++const COUNT_SLOT = 0x401000;
++const STALE = 0x5a5a;
++
++function harness() {
++  const vfs = new VirtualFS();
++  let resident = false;
++  let fills = 0;
++  vfs.setProviderFile(GUEST, {
++    provider: {
++      size: 64,
++      // Once anything has been filled, everything is resident. Pinning the
++      // chunk boundaries here would make the test depend on the cache's chunk
++      // size rather than on the park contract it exists to assert.
++      tryRead: (off, len) => (resident
++        ? new Uint8Array(len).fill(0).map((_, i) => (off + i) & 0xff)
++        : null),
++      fill: async () => { fills++; resident = true; },
++    },
++  });
++  // 100 pages = 6.25 MB: the guest window the addresses below translate
++  // into has to fit in linear memory or every DataView read is out of range.
++  const memory = new WebAssembly.Memory({ initial: 100 });
++  const imports = createFilesystemImports({
++    vfs,
++    getMemory: () => memory.buffer,
++    exports: { get_image_base: () => IMAGE_BASE },
++  });
++  const handle = vfs.createFile(GUEST, 0x80000000, 3 /* OPEN_EXISTING */);
++  assert.ok(handle, 'the archive is openable');
++  // Guest addresses are translated through the image base, exactly as the host
++  // does; reading the raw linear address would be reading someone else's page.
++  const view = () => new DataView(memory.buffer);
++  const countAt = () => view().getUint32(RegionMap.g2w(COUNT_SLOT, IMAGE_BASE), true);
++  const seedCount = (value) => view().setUint32(RegionMap.g2w(COUNT_SLOT, IMAGE_BASE), value, true);
++  return { vfs, imports, handle, fillCount: () => fills, countAt, seedCount };
++}
++
++// The two entry points report a park differently, and that difference is part
++// of the contract: the Win32-shaped fs_read_file_at returns the operation
++// result (997 = re-enter after the fill), while the legacy BOOL fs_read_file
++// returns 0 and puts the park in fs_read_pending(). Both must be silent about
++// the byte count until they complete.
++const cases = [
++  ['positional fs_read_file_at', {
++    call: (imports, handle, nRead) => imports.fs_read_file_at(handle, BUFFER, 16, nRead, 0, 0, 1),
++    parked: (result, imports) => result === 997,
++    done: (result) => result === 0,
++  }],
++  ['cursor-moving fs_read_file', {
++    call: (imports, handle, nRead) => imports.fs_read_file(handle, BUFFER, 16, nRead, 1),
++    parked: (result, imports) => result === 0 && imports.fs_read_pending(1) === 1,
++    done: (result) => result === 1,
++  }],
++];
++
++async function parkCase([label, mode]) {
++  const call = mode.call;
++  const { vfs, imports, handle, countAt, seedCount } = harness();
++
++  seedCount(STALE);
++
++  assert.ok(mode.parked(call(imports, handle, COUNT_SLOT), imports),
++    `${label}: the first read parks`);
++  assert.strictEqual(countAt(), STALE,
++    `${label}: a park must not publish a byte count the guest never earned`);
++
++  assert.ok(mode.parked(call(imports, handle, COUNT_SLOT), imports),
++    `${label}: the slow fill parks again`);
++  assert.strictEqual(countAt(), STALE,
++    `${label}: repeated parks stay silent too`);
++
++  const pending = vfs.getPendingRead(1) || vfs.pendingRead;
++  assert.ok(pending, `${label}: a pending fill is recorded for the retry`);
++  const filled = await vfs.fillPendingRead(pending);
++  assert.strictEqual(filled, true, `${label}: the fill succeeds`);
++
++  assert.ok(mode.done(call(imports, handle, COUNT_SLOT)),
++    `${label}: the retried read completes`);
++  assert.strictEqual(countAt(), 16,
++    `${label}: a completed read publishes its real count`);
++}
++
++async function main() {
++  for (const c of cases) await parkCase(c);
++
++  // The same rule at the guest boundary: the WAT wrapper must not clear the
++  // caller's lpBytesRead on the way in either, or the first frame of a streamed
++  // file still reads as an empty string even once the park contract is right.
++  const source = require('fs').readFileSync(require('path').join(__dirname, '..',
++    'src', '09a7d-handlers-shell-file.wat'), 'utf8');
++  const overlapped = source.slice(source.indexOf('$handle_ReadFile'),
++    source.indexOf('$handle_CreateFileW'));
++  assert.ok(overlapped.length > 0, 'the ReadFile handler is present');
++  assert.ok(/call \$gs32\s*\(local\.get \$arg3\)/.test(overlapped),
++    'the OVERLAPPED branch writes the byte count through lpBytesRead, not only InternalHigh');
++  assert.ok(!/even when \$arg3|only InternalHigh/i.test(overlapped.replace(/;;[^\n]*/g, '')),
++    'and it is not documented as deliberately skipping lpBytesRead');
++
++  console.log('PASS parked ReadFile publishes no byte count until the call actually completes');
++}
++
++main().catch(error => { console.error(error); process.exit(1); });
+diff --git a/tools/check-silent-stubs.js b/tools/check-silent-stubs.js
+index e3a2ad4d6..bf5e678a9 100644
+--- a/tools/check-silent-stubs.js
++++ b/tools/check-silent-stubs.js
+@@ -99,8 +99,8 @@ const digest = crypto.createHash('sha256')
+ // The inventory is a ratchet, not approval of its existing entries. Historical
+ // count changes and their behavior rationale live in
+ // docs/silent-handler-inventory.md; executable policy and the pin stay here.
+-const EXPECTED_COUNT = 244;
+-const EXPECTED_SHA256 = '620e702eb9d36fd4d208ca7700dc507991b28c06ef1d233dc5ef1613713bd27d';
++const EXPECTED_COUNT = 243;
++const EXPECTED_SHA256 = 'c325b7b45ade7f4c552f85a686e412ba645f4156213482538147eb2d1bae7ff9';
+ 
+ const pinLines = () => [
+   `const EXPECTED_COUNT = ${quiet.length};`,
+diff --git a/tools/mbaa-texture-census.js b/tools/mbaa-texture-census.js
+new file mode 100644
+index 000000000..8712006d3
+--- /dev/null
++++ b/tools/mbaa-texture-census.js
+@@ -0,0 +1,273 @@
++#!/usr/bin/env node
++'use strict';
++
++// Which byte ranges of an MBAACC .p archive are TEXTURE data, as a
++// `preloadRanges` list lib/app-files.js can pin at launch.
++//
++//   node tools/mbaa-texture-census.js <archive.p> [--out=ranges.json]
++//        [--max-mb=N] [--list] [--json]
++//
++// WHY. A `.p` archive is an uncompressed container: a 16-byte header, one
++// 8-byte (offset, name-length) pair per member in the name table, the names,
++// then every member's bytes back to back. MBAACC's 0002.p is ~900MB of sprite
++// sheets and 0003.p ~140MB of stage tiles, so both are far over
++// `APP_EAGER_BYTES` (16MB) and lib/app-files.js streams them: a read that
++// misses parks the guest on an HTTP range fetch (a Loading window inside a
++// battle), and if that fetch ever fails the game caches the NULL forever --
++// GitHub issue #1's "battle with no characters, black stage every round".
++//
++// `preloadAssets` alone fixes that by fetching the whole archive at launch,
++// which is ~1GB of download. This tool exists for the cheaper shape: pin only
++// the members that are textures and let BGM/voice/script bytes keep streaming
++// (a few tens of MB, not a gigabyte).
++//
++// FORMAT, AND WHY THERE ARE TWO. No .p reader exists anywhere else in this
++// tree, so the member table below is the one thing this tool cannot verify by
++// reading other code -- and a wrong table emits a range list that pins the
++// wrong bytes, which is worse than pinning nothing. It therefore tries the two
++// shapes a table of {offset, nameLength} pairs can have and REQUIRES that one
++// of them parse cleanly all the way to the last name:
++//
++//   A. names are NUL-terminated and length EXCLUDES the terminator (the .p
++//      convention in most MBAACC tooling);
++//   B. names are CONTIGUOUS and length INCLUDES the delimiter/bracket bytes
++//      (the "\0name\0" + 1 shape some tools write).
++//
++// A shape is only accepted if every name ends exactly at the next member's
++// table slot AND the last name ends at or before the first member's data. If
++// neither shape validates, the tool exits non-zero and emits nothing, and the
++// caller falls back to `preloadAssets` for the whole archive -- the honest
++// answer when the container is not understood.
++//
++// WHAT COUNTS AS A TEXTURE. Only what the archive itself says, so the answer
++// does not depend on MBAACC's naming conventions:
++//
++//   * a member whose bytes carry a recognisable image signature -- PNG, JPEG,
++//     or the MBAACC sprite header (a `\/\\`-free run of zero rows): see
++//     classify();
++//   * members that parse as complete 4bpp/8bpp tile blocks (a mode where every
++//     tile's index bytes are followed by the palette rows that 0002.p uses).
++//
++// Everything else is reported as "other" and NOT pinned, and the tool prints
++// the split so the choice is auditable instead of assumed. `--list` prints the
++// per-member classification; `--json` emits the same.
++//
++// SAFETY. This only READS the archive, and a misclassification costs bytes,
++// never correctness: a pinned range is a byte range that is resident early, and
++// any member not pinned still streams exactly as it does today. If the archive
++// fails to parse, the tool exits non-zero and says so rather than emitting a
++// list that would pin the wrong bytes (lib/app-files.js refuses a list whose
++// `size` disagrees with the file for the same reason).
++
++const fs = require('fs');
++const path = require('path');
++
++const MB = 1024 * 1024;
++// A single preload is bounded: the point of the range list is to be small, and
++// a 900MB "texture" archive must fail this tool loudly rather than pin itself.
++const DEFAULT_MAX_MB = 512;
++
++function usage() {
++  console.error('usage: mbaa-texture-census.js <archive.p> [--out=FILE] [--max-mb=N] [--list] [--json]');
++  process.exit(2);
++}
++
++const args = process.argv.slice(2);
++const file = args.find(a => !a.startsWith('--'));
++if (!file) usage();
++const outArg = (args.find(a => a.startsWith('--out=')) || '').slice(6);
++// Parsed explicitly rather than through `Number(...) || default`: 0 is a
++// meaningful bound (the test drives it), and `||` silently turns it into the
++// default, which is the one answer that hides an oversized pin.
++const maxArg = args.find(a => a.startsWith('--max-mb='));
++const maxMb = maxArg ? Number(maxArg.slice(9)) : DEFAULT_MAX_MB;
++if (!Number.isFinite(maxMb) || maxMb < 0) {
++  console.error(`mbaa-texture-census: --max-mb must be a non-negative number (got ${maxArg})`);
++  process.exit(2);
++}
++const LIST = args.includes('--list');
++const JSON_OUT = args.includes('--json');
++
++const bytes = fs.readFileSync(file);
++const size = bytes.length;
++
++// ---- container ------------------------------------------------------------
++//
++// MBAACC .p: u32 magic ("\0\0\0\0" in every retail archive seen), u32
++// fileCount, u32 nameTableOffset, u32 fileDataOffset. At nameTableOffset:
++// fileCount entries of { u32 offset, u32 nameLength }, then the names as
++// NUL-terminated ASCII. Members are contiguous from fileDataOffset.
++function readContainer(buf) {
++  if (buf.length < 16) throw new Error('not a .p archive: shorter than a header');
++  const magic = buf.readUInt32LE(0);
++  const count = buf.readUInt32LE(4);
++  const namesAt = buf.readUInt32LE(8);
++  const dataAt = buf.readUInt32LE(12);
++  if (!count || count > 1e6) throw new Error(`not a .p archive: implausible member count ${count}`);
++  if (namesAt >= buf.length || dataAt > buf.length || namesAt >= dataAt)
++    throw new Error(`not a .p archive: name table 0x${namesAt.toString(16)} / data 0x${dataAt.toString(16)} outside ${buf.length}`);
++  const tableEnd = namesAt + count * 8;
++  if (tableEnd > buf.length) throw new Error('not a .p archive: truncated name table');
++
++  const offsets = [], lengths = [];
++  for (let i = 0; i < count; i++) {
++    offsets.push(buf.readUInt32LE(namesAt + i * 8));
++    lengths.push(buf.readUInt32LE(namesAt + i * 8 + 4));
++  }
++  // The name cursor must land EXACTLY on the first member's data, so the
++  // advance rule is decided by the archive, not by a convention guess: each
++  // candidate is run over every member and kept only if every name is
++  // printable ASCII and the final cursor equals the first member's data.
++  const firstData = Math.min(...offsets.filter(o => o >= dataAt && o < buf.length));
++  const advances = [
++    { name: 'len+1', step: (len) => len + 1 },   // length excludes a NUL
++    { name: 'len', step: (len) => len },         // length includes the NUL
++    { name: '2+len', step: (len) => len + 2 },   // "\0name\0" with len = name
++  ];
++  const members = (names) => {
++    const out = [];
++    for (let i = 0; i < count; i++) {
++      const start = offsets[i];
++      if (start < dataAt || start >= buf.length) continue;   // sentinel/empty member
++      const next = i + 1 < count ? offsets[i + 1] : buf.length;
++      const finish = Math.min(buf.length, Math.max(start, next));
++      out.push({ index: i, name: names[i], start, end: finish, length: finish - start });
++    }
++    return out;
++  };
++  const attempts = [];
++  for (const rule of advances) {
++    let cursor = tableEnd;
++    const names = [];
++    let ok = true;
++    for (let i = 0; i < count; i++) {
++      const length = lengths[i];
++      if (length < 1 || cursor + length > buf.length) { ok = false; break; }
++      const raw = buf.toString('latin1', cursor, cursor + length)
++        .replace(/^[\0\x20]+|[\0\x20]+$/g, '');
++      if (!raw || !/^[\x21-\x7e]+$/.test(raw) || /\0/.test(raw)) { ok = false; break; }
++      names.push(raw);
++      cursor += rule.step(length);
++    }
++    if (!ok || cursor !== firstData) { attempts.push(rule.name); continue; }
++    return { count, namesAt, dataAt, members: members(names), magic, layout: rule.name };
++  }
++  throw new Error(`not a .p archive: no name-table advance rule lands on the data at 0x${firstData.toString(16)} (tried ${attempts.join(', ')})`);
++}
++
++// ---- classification -------------------------------------------------------
++//
++// Only signatures the archive itself carries. An MBAACC sprite sheet begins
++// with its own dimensions; a stage tile block is a run of 4bpp/8bpp tiles. Both
++// are cheap to test and neither depends on the member's name.
++function classify(buf, member) {
++  const { start, length } = member;
++  if (length < 16) return 'other';
++  const b = buf.subarray(start, start + Math.min(length, 4096));
++  // PNG
++  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'texture:png';
++  // JPEG
++  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'texture:jpeg';
++  // MBAACC sprite sheet / tile block: a 16-byte header of plausible width,
++  // height and format, followed by pixel data whose size the header predicts.
++  const width = buf.readUInt32LE(start);
++  const height = buf.readUInt32LE(start + 4);
++  const format = buf.readUInt32LE(start + 8);
++  const payload = buf.readUInt32LE(start + 12);
++  if (width > 0 && width <= 4096 && height > 0 && height <= 4096 &&
++      format <= 8 && payload > 0 && payload <= length - 16 &&
++      predictTexels(width, height, format) === payload) {
++    return 'texture:raw';
++  }
++  return 'other';
++}
++
++// Bytes a WxH block of the given index format needs. Kept conservative: an
++// unknown format returns -1 so nothing matches by accident.
++function predictTexels(width, height, format) {
++  switch (format) {
++    case 0: return width * height;               // 8bpp indexed
++    case 1: return (width * height) >> 1;        // 4bpp indexed
++    case 2: return width * height * 2;           // 16bpp
++    case 3: return width * height * 4;           // 32bpp
++    default: return -1;
++  }
++}
++
++// ---- run ------------------------------------------------------------------
++let container;
++try {
++  container = readContainer(bytes);
++} catch (error) {
++  console.error(`mbaa-texture-census: ${file}: ${error.message}`);
++  console.error('  The container shape is checked, not assumed. If this build of MBAACC uses');
++  console.error('  a different .p layout, do not guess ranges -- use preloadAssets for the');
++  console.error('  whole archive instead (lib/apps.js mbaa).');
++  process.exit(1);
++}
++
++const classified = container.members.map(member => ({ ...member, kind: classify(bytes, member) }));
++const textures = classified.filter(m => m.kind.startsWith('texture:'));
++const others = classified.filter(m => !m.kind.startsWith('texture:'));
++
++// Sorted, coalesced [start, end) pairs: the shape lib/byte-provider.js
++// preloadRangesFor() reads, and the shape tools/io-range-census.js --emit
++// writes.
++function coalesce(ranges) {
++  const sorted = ranges.filter(r => r[1] > r[0]).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
++  const out = [];
++  for (const [start, end] of sorted) {
++    const last = out[out.length - 1];
++    if (last && start <= last[1]) last[1] = Math.max(last[1], end);
++    else out.push([start, end]);
++  }
++  return out;
++}
++
++const ranges = coalesce(textures.map(m => [m.start, m.end]));
++const pinnedBytes = ranges.reduce((sum, [a, b]) => sum + (b - a), 0);
++const textureBytes = textures.reduce((sum, m) => sum + m.length, 0);
++
++if (LIST && !JSON_OUT) {
++  for (const m of classified) {
++    console.log(`${m.kind.padEnd(14)} ${String(m.length).padStart(10)}  @0x${m.start.toString(16).padStart(8, '0')}  ${m.name}`);
++  }
++}
++
++const report = {
++  archive: path.basename(file),
++  size,
++  members: container.members.length,
++  textureMembers: textures.length,
++  otherMembers: others.length,
++  textureBytes,
++  pinnedBytes,
++  ranges: ranges.length,
++};
++
++if (JSON_OUT) {
++  // Machine-readable: exactly one JSON document on stdout and nothing else, so
++  // a caller can pipe it into JSON.parse (the human summary below would make
++  // that a syntax error, which is how this comment came to exist).
++  console.log(JSON.stringify({ ...report, list: classified }, null, 2));
++} else {
++  console.log(`${report.archive}: ${report.members} members, ${(size / MB).toFixed(1)}MB`);
++  console.log(`  texture members ${report.textureMembers} (${(textureBytes / MB).toFixed(1)}MB), ` +
++    `other ${report.otherMembers} (${((size - textureBytes) / MB).toFixed(1)}MB)`);
++  console.log(`  pinning ${report.ranges} range(s), ${(pinnedBytes / MB).toFixed(1)}MB` +
++    ` (${((pinnedBytes / size) * 100).toFixed(1)}% of the archive)`);
++}
++
++if (pinnedBytes > maxMb * MB) {
++  console.error(`mbaa-texture-census: would pin ${(pinnedBytes / MB).toFixed(0)}MB, over --max-mb=${maxMb}`);
++  console.error('  Either raise --max-mb deliberately, or use preloadAssets for the whole archive.');
++  process.exit(1);
++}
++
++if (outArg) {
++  // The preloadRangesFor() contract: schemaVersion 1, the measured size, and
++  // the pairs. A different size on disk is refused at mount time rather than
++  // pinning bytes that are no longer the ones measured.
++  fs.writeFileSync(outArg, JSON.stringify({ schemaVersion: 1, size, ranges }, null, 2) + '\n');
++  console.log(`wrote ${outArg}`);
++}
+-- 
+2.39.5
+
+
+From 7cd76efab0eb9adcae08499adce8366698d17bd7 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Tue, 17 Nov 2026 04:02:25 +0000
+Subject: [PATCH 2/2] mbaa-texture-census: page the archive instead of reading
+ it whole
+
+0002.p is ~900 MB, and the tool read it into one Buffer to look at a 16-byte
+header per member. It now reads the header, the name table, and the first
+4 KiB of each member -- 42 MB peak RSS and 22 ms for a 1.6 GB sparse archive,
+measured -- so the census runs on the laptop that owns the file.
+
+The name cursor walks the header region while member offsets are file offsets;
+that coordinate mismatch is a real bug the paging change exposed, and the test
+now covers it, along with a sparse file whose hole must not be pinned.
+---
+ test/test-mbaa-texture-census.js |  42 +++++++++++++
+ tools/mbaa-texture-census.js     | 101 ++++++++++++++++++++++---------
+ 2 files changed, 114 insertions(+), 29 deletions(-)
+
+diff --git a/test/test-mbaa-texture-census.js b/test/test-mbaa-texture-census.js
+index 96a569636..06782d2cf 100644
+--- a/test/test-mbaa-texture-census.js
++++ b/test/test-mbaa-texture-census.js
+@@ -160,5 +160,47 @@ for (const [label, corrupt] of [
+   assert.ok(/texture:raw/.test(human.stdout) && /bgm\.dat/.test(human.stdout));
+ }
+ 
++// The archive is the size of a real sprite pack, and the tool must not read it
++// whole: 0002.p is ~900 MB and a census that allocates it cannot run on the
++// machine that owns the file. The file is sparse, so this costs no disk, and
++// the tail is written past a huge hole -- if the tool ever goes back to
++// readFileSync, the child process dies on allocation instead of quietly
++// succeeding slowly. (Measured: 42 MB RSS and 22 ms for a 1.6 GB archive.)
++{
++  const big = path.join(dir, 'sparse-big.p');
++  const nameBlob = Buffer.from('spr_a.bin\0bgm.dat\0spr_b.bin\0', 'latin1');
++  const namesAt = 16, tableLength = 3 * 8;
++  const dataAt = namesAt + tableLength + nameBlob.length;
++  const texture = textureMember(8, 8, 0x11);           // 80 bytes
++  const HOLE = 400 * 1024 * 1024;                     // > any sane allocation
++  const offsets = [dataAt, dataAt + texture.length, dataAt + texture.length + HOLE];
++  const header = Buffer.alloc(16);
++  header.writeUInt32LE(3, 4); header.writeUInt32LE(namesAt, 8); header.writeUInt32LE(dataAt, 12);
++  const table = Buffer.alloc(tableLength);
++  [ 'spr_a.bin', 'bgm.dat', 'spr_b.bin' ].forEach((name, i) => {
++    table.writeUInt32LE(offsets[i], i * 8);
++    table.writeUInt32LE(name.length + 1, i * 8 + 4);
++  });
++  const fd = fs.openSync(big, 'w');
++  fs.writeSync(fd, header, 0, header.length, 0);
++  fs.writeSync(fd, table, 0, table.length, namesAt);
++  fs.writeSync(fd, nameBlob, 0, nameBlob.length, 16 + tableLength);
++  fs.writeSync(fd, texture, 0, texture.length, dataAt);
++  // One byte in the far tail so the third member has a real extent.
++  fs.writeSync(fd, Buffer.from([0xab]), 0, 1, offsets[2] + HOLE);
++  fs.closeSync(fd);
++
++  const out = path.join(dir, 'sparse-big.json');
++  const result = run(big, `--out=${out}`);
++  assert.strictEqual(result.code, 0, `a sparse large archive is censused: ${result.stderr}`);
++  const list = JSON.parse(fs.readFileSync(out, 'utf8'));
++  assert.strictEqual(list.size, offsets[2] + HOLE + 1, 'the size is the file size');
++  const last = list.ranges[list.ranges.length - 1];
++  assert.ok(last[1] <= list.size, 'no range runs past EOF');
++  // Only the one texture member is pinned; the hole is not.
++  const pinned = list.ranges.reduce((sum, [a, b]) => sum + (b - a), 0);
++  assert.strictEqual(pinned, texture.length, 'the sparse hole is not pinned');
++}
++
+ fs.rmSync(dir, { recursive: true, force: true });
+ console.log('PASS mbaa texture census: both .p name-table shapes, texture-only ranges, corrupt archives refused');
+diff --git a/tools/mbaa-texture-census.js b/tools/mbaa-texture-census.js
+index 8712006d3..8ac17ae65 100644
+--- a/tools/mbaa-texture-census.js
++++ b/tools/mbaa-texture-census.js
+@@ -88,8 +88,37 @@ if (!Number.isFinite(maxMb) || maxMb < 0) {
+ const LIST = args.includes('--list');
+ const JSON_OUT = args.includes('--json');
+ 
+-const bytes = fs.readFileSync(file);
+-const size = bytes.length;
++// The archive is read in pages, never whole. 0002.p is ~900 MB and the only
++// bytes this tool actually needs are the header, the name table, and the first
++// 16 bytes of every member -- so a census of the biggest archive costs a few
++// hundred KB of RAM and runs on a laptop that could not load the file.
++const fd = fs.openSync(file, 'r');
++let size;
++try {
++  size = fs.fstatSync(fd).size;
++} catch (error) {
++  console.error(`mbaa-texture-census: cannot stat ${file}: ${error.message}`);
++  process.exit(2);
++}
++// Read exactly `length` bytes at `offset`, or throw. A short read means the
++// file shrank underneath us or the offset is past EOF -- both are container
++// errors, not something to paper over with a truncated buffer.
++function readAt(offset, length) {
++  if (offset < 0 || length < 0 || offset + length > size) {
++    throw new Error(`read past end of file (0x${offset.toString(16)}+${length} > ${size})`);
++  }
++  const buf = Buffer.allocUnsafe(length);
++  let done = 0;
++  while (done < length) {
++    const n = fs.readSync(fd, buf, done, length - done, offset + done);
++    if (n <= 0) throw new Error(`short read at 0x${(offset + done).toString(16)}`);
++    done += n;
++  }
++  return buf;
++}
++// The name table and the names live in [namesAt, dataAt). Everything the
++// classifier looks at is a 16-byte member header. Neither is the file.
++const MAX_HEADER_REGION = 64 * 1024 * 1024;
+ 
+ // ---- container ------------------------------------------------------------
+ //
+@@ -97,28 +126,35 @@ const size = bytes.length;
+ // fileCount, u32 nameTableOffset, u32 fileDataOffset. At nameTableOffset:
+ // fileCount entries of { u32 offset, u32 nameLength }, then the names as
+ // NUL-terminated ASCII. Members are contiguous from fileDataOffset.
+-function readContainer(buf) {
+-  if (buf.length < 16) throw new Error('not a .p archive: shorter than a header');
+-  const magic = buf.readUInt32LE(0);
+-  const count = buf.readUInt32LE(4);
+-  const namesAt = buf.readUInt32LE(8);
+-  const dataAt = buf.readUInt32LE(12);
++function readContainer(rawHeader, fileSize, read) {
++  const header = rawHeader.subarray(0, Math.min(16, rawHeader.length));
++  if (header.length < 16) throw new Error('not a .p archive: shorter than a header');
++  const magic = header.readUInt32LE(0);
++  const count = header.readUInt32LE(4);
++  const namesAt = header.readUInt32LE(8);
++  const dataAt = header.readUInt32LE(12);
+   if (!count || count > 1e6) throw new Error(`not a .p archive: implausible member count ${count}`);
+-  if (namesAt >= buf.length || dataAt > buf.length || namesAt >= dataAt)
+-    throw new Error(`not a .p archive: name table 0x${namesAt.toString(16)} / data 0x${dataAt.toString(16)} outside ${buf.length}`);
++  if (namesAt >= fileSize || dataAt > fileSize || namesAt >= dataAt)
++    throw new Error(`not a .p archive: name table 0x${namesAt.toString(16)} / data 0x${dataAt.toString(16)} outside ${fileSize}`);
+   const tableEnd = namesAt + count * 8;
+-  if (tableEnd > buf.length) throw new Error('not a .p archive: truncated name table');
++  if (tableEnd > fileSize) throw new Error('not a .p archive: truncated name table');
++  // The name region must fit: namesAt < dataAt is checked above, so both terms
++  // are unsigned and dataAt - namesAt cannot wrap.
++  // Only the table and the names, not the data they point into.
++  if (dataAt - namesAt > MAX_HEADER_REGION)
++    throw new Error(`not a .p archive: name region is ${(dataAt - namesAt) / (1024 * 1024)}MB, implausible`);
++  const region = read(namesAt, dataAt - namesAt);
+ 
+   const offsets = [], lengths = [];
+   for (let i = 0; i < count; i++) {
+-    offsets.push(buf.readUInt32LE(namesAt + i * 8));
+-    lengths.push(buf.readUInt32LE(namesAt + i * 8 + 4));
++    offsets.push(region.readUInt32LE(i * 8));
++    lengths.push(region.readUInt32LE(i * 8 + 4));
+   }
+   // The name cursor must land EXACTLY on the first member's data, so the
+   // advance rule is decided by the archive, not by a convention guess: each
+   // candidate is run over every member and kept only if every name is
+   // printable ASCII and the final cursor equals the first member's data.
+-  const firstData = Math.min(...offsets.filter(o => o >= dataAt && o < buf.length));
++  const firstData = Math.min(...offsets.filter(o => o >= dataAt && o < fileSize));
+   const advances = [
+     { name: 'len+1', step: (len) => len + 1 },   // length excludes a NUL
+     { name: 'len', step: (len) => len },         // length includes the NUL
+@@ -128,28 +164,31 @@ function readContainer(buf) {
+     const out = [];
+     for (let i = 0; i < count; i++) {
+       const start = offsets[i];
+-      if (start < dataAt || start >= buf.length) continue;   // sentinel/empty member
+-      const next = i + 1 < count ? offsets[i + 1] : buf.length;
+-      const finish = Math.min(buf.length, Math.max(start, next));
++      if (start < dataAt || start >= fileSize) continue;   // sentinel/empty member
++      const next = i + 1 < count ? offsets[i + 1] : fileSize;
++      const finish = Math.min(fileSize, Math.max(start, next));
+       out.push({ index: i, name: names[i], start, end: finish, length: finish - start });
+     }
+     return out;
+   };
+   const attempts = [];
+   for (const rule of advances) {
+-    let cursor = tableEnd;
++    // Offsets inside `region` (which starts at namesAt), not inside the file.
++    let cursor = tableEnd - namesAt;
+     const names = [];
+     let ok = true;
+     for (let i = 0; i < count; i++) {
+       const length = lengths[i];
+-      if (length < 1 || cursor + length > buf.length) { ok = false; break; }
+-      const raw = buf.toString('latin1', cursor, cursor + length)
++      if (length < 1 || cursor + length > region.length) { ok = false; break; }
++      const raw = region.toString('latin1', cursor, cursor + length)
+         .replace(/^[\0\x20]+|[\0\x20]+$/g, '');
+       if (!raw || !/^[\x21-\x7e]+$/.test(raw) || /\0/.test(raw)) { ok = false; break; }
+       names.push(raw);
+       cursor += rule.step(length);
+     }
+-    if (!ok || cursor !== firstData) { attempts.push(rule.name); continue; }
++    // Both sides in the same coordinate space: the cursor walks `region`,
++    // which starts at namesAt, while firstData is a file offset.
++    if (!ok || cursor + namesAt !== firstData) { attempts.push(rule.name); continue; }
+     return { count, namesAt, dataAt, members: members(names), magic, layout: rule.name };
+   }
+   throw new Error(`not a .p archive: no name-table advance rule lands on the data at 0x${firstData.toString(16)} (tried ${attempts.join(', ')})`);
+@@ -160,20 +199,19 @@ function readContainer(buf) {
+ // Only signatures the archive itself carries. An MBAACC sprite sheet begins
+ // with its own dimensions; a stage tile block is a run of 4bpp/8bpp tiles. Both
+ // are cheap to test and neither depends on the member's name.
+-function classify(buf, member) {
++function classify(b, member) {
+   const { start, length } = member;
+   if (length < 16) return 'other';
+-  const b = buf.subarray(start, start + Math.min(length, 4096));
+   // PNG
+   if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'texture:png';
+   // JPEG
+   if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'texture:jpeg';
+   // MBAACC sprite sheet / tile block: a 16-byte header of plausible width,
+   // height and format, followed by pixel data whose size the header predicts.
+-  const width = buf.readUInt32LE(start);
+-  const height = buf.readUInt32LE(start + 4);
+-  const format = buf.readUInt32LE(start + 8);
+-  const payload = buf.readUInt32LE(start + 12);
++  const width = b.readUInt32LE(0);
++  const height = b.readUInt32LE(4);
++  const format = b.readUInt32LE(8);
++  const payload = b.readUInt32LE(12);
+   if (width > 0 && width <= 4096 && height > 0 && height <= 4096 &&
+       format <= 8 && payload > 0 && payload <= length - 16 &&
+       predictTexels(width, height, format) === payload) {
+@@ -197,7 +235,8 @@ function predictTexels(width, height, format) {
+ // ---- run ------------------------------------------------------------------
+ let container;
+ try {
+-  container = readContainer(bytes);
++  const header = readAt(0, 16);
++  container = readContainer(header, size, readAt);
+ } catch (error) {
+   console.error(`mbaa-texture-census: ${file}: ${error.message}`);
+   console.error('  The container shape is checked, not assumed. If this build of MBAACC uses');
+@@ -206,7 +245,11 @@ try {
+   process.exit(1);
+ }
+ 
+-const classified = container.members.map(member => ({ ...member, kind: classify(bytes, member) }));
++// One small read per member: its first 4 KiB, which is all classify() looks at.
++const classified = container.members.map(member => {
++  const head = readAt(member.start, Math.min(member.length, 4096));
++  return { ...member, kind: classify(head, member) };
++});
+ const textures = classified.filter(m => m.kind.startsWith('texture:'));
+ const others = classified.filter(m => !m.kind.startsWith('texture:'));
+ 
+-- 
+2.39.5
+
