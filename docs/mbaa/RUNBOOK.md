@@ -400,3 +400,55 @@ node test/test-d3d9-p8-conversion.js         -> PASS
 
 The only failure encountered was `Cannot find module 'pngjs'` before step 2's
 install, which is why that install is now the first thing in step 2.
+
+---
+
+## Troubleshooting
+
+### `error: Your local changes to README.md would be overwritten by checkout`
+
+This is not caused by this branch. `README.md` is **byte-identical** between
+`main` and this branch — the PR's file list does not include it — so git is
+refusing because of a change *you* have locally, not because the branch carries
+a competing copy.
+
+Two ways to find out which it is:
+
+```bash
+git diff README.md          # real edits: you will see your text
+git diff --stat README.md   # empty output but still "modified" = line endings
+```
+
+**If it shows your edits**, keep them across the switch:
+
+```bash
+git stash push -m "readme WIP" README.md
+git checkout arena/42e272c4-mekt
+git stash pop
+```
+
+**If the diff is empty but git still calls it modified**, your clone is
+normalising line endings. That happens with `core.autocrlf` on Windows or WSL
+(the repo stores LF, git hands you CRLF, and the working copy then looks
+changed forever). One-time fix, from the repo root:
+
+```bash
+git config core.autocrlf false
+git checkout -- README.md
+```
+
+Adding a `.gitattributes` with `* text=auto` would make this consistent for
+everyone instead of per-machine, and is worth doing on its own.
+
+**One structural note.** This checkout is a **shallow clone** (`.git/shallow`
+contains `55c6010`, and `55c6010` is `main`'s tip and has no parent here). In a
+shallow clone the branch's merge base is unknown, so git cannot prove that
+`README.md` is identical on both sides and treats the switch as a two-way merge.
+Deepening fixes it permanently:
+
+```bash
+git fetch --unshallow
+```
+
+That is also why `git log` shows one commit — the history is not broken, it is
+just not downloaded.
