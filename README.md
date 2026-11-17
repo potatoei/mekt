@@ -1,7 +1,7 @@
 # melty-web
 
 A browser-native WebAssembly port of *Melty Blood Actress Again Current Code* (MBAACC v1.07 Rev 1.4.0) running in the browser via an x86-to-WebAssembly compatibility layer.
-
+thank you stevenvinhtran
 ---
 
 ## Architecture Overview
