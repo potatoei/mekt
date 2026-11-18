@@ -32,3 +32,11 @@ assets/raw/
 
 # Temporary scratch and debug artifacts
 scratch/
+
+# Handover: the owner's own working copy of the site and the reassembled game
+# data live here and are NOT in this repo. They are deliberately kept out of
+# version control (the archives are ~1 GB), but they must never be assumed
+# disposable -- see HANDOVER.md §7.1.
+site/
+site/chunks/
+assets/raw/
